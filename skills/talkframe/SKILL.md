@@ -62,7 +62,7 @@ The heavy lifting happens on a GPU machine. `scripts/talkframe.py` plans the job
 | A different take of the same clip | `--seed <n>` |
 | Softness | `--resolution 720`, or `--steps 8` |
 | Logo or text in the photo wobbles (mic flag, sign, printed name) | `--protect-region X,Y,W,H` (photo pixels; see below) |
-| Mouth hangs open during pauses | Already handled: silences get a quiet noise floor before the model. `--no-noise-floor` turns it off for comparison. |
+| Mouth hangs open during short pauses | Partly handled: silences get a quiet noise floor before the model (measured ~20–30% less opening). The rest is the model anticipating the next word; avoid pure-zero gaps when editing the voice track. `--no-noise-floor` turns the floor off. |
 
 ### Keeping a logo exact
 

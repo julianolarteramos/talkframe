@@ -121,7 +121,7 @@ def plan(args):
         wav = os.path.join(work, "in", f"{name}.wav")
         # The model only hears this copy; the final video keeps the original audio. Pure digital silence (exact zeros,
         # typical between edited clips) makes InfiniteTalk open the mouth wide during pauses, so a pink-noise floor (~-57 dBFS RMS)
-        # is mixed in. That is about the level of quiet room tone; under speech it is inaudible to the model.
+        # is mixed in (measured: ~20-30% less mouth opening in pauses). That is about the level of quiet room tone.
         noise = "" if args.no_noise_floor else \
             ";anoisesrc=color=pink:amplitude=0.008:sample_rate=24000[n];[v][n]amix=inputs=2:duration=first:normalize=0"
         run(["ffmpeg", "-v", "error", "-y", "-i", args.audio, "-filter_complex",

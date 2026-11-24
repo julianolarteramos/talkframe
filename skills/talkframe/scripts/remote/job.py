@@ -82,6 +82,8 @@ def setup_comfy(comfy):
 
 
 def download_models(comfy):
+    # the models are public; without this, huggingface_hub on Colab waits ~10 s for a notebook secret that never comes
+    os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
     if not _has("huggingface_hub"):
         pip_install("huggingface_hub")
     from huggingface_hub import hf_hub_download
