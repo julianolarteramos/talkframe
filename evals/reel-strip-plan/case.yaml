@@ -1,0 +1,41 @@
+schema_version: "1.1"
+name: reel-strip-plan
+description: Portrait photo + short voice clip, user wants a horizontal strip for the bottom of a vertical reel; plan only.
+tags: [trigger, planning]
+context:
+  add_dirs: [fixtures]
+execution:
+  prompt: |
+    hey, fixtures/presenter.jpg is our AI news host and fixtures/voice-8s.mp3 is today's intro line (spanish).
+    I want her saying that line as a talking video that sits in a horizontal band at the bottom of a 1080x1920 reel,
+    so landscape and not wider than 1080px. Don't render anything yet, I just want to see the plan it would run
+    (put whatever it writes under out/). Tell me the frame size and how long it would take.
+  max_turns: 25
+  timeout_seconds: 600
+  allowed_tools: [Read, Glob, Grep, Skill]
+graders:
+  - name: skill-fired
+    type: tool_used
+    tool: Skill
+    input_match: '"skill"\s*:\s*"(?:[\w-]+:)?talkframe"'
+    arm: with-only
+  - name: dry-run-used
+    type: tool_used
+    tool: Bash
+    input_match: "talkframe.py generate.*--dry-run|--dry-run.*talkframe.py generate"
+    weight: 2
+  - name: plan-written
+    type: file_exists
+    path: "out/**/plan.json"
+  - name: landscape-under-1080
+    type: llm
+    target: { source: file, path: "out/**/plan.json" }
+    criteria: |
+      PASS if output_size is landscape (first number, the width, is larger than the second) and the width is at most 1080.
+      FAIL if it is portrait/square, wider than 1080, or the file is missing.
+  - name: honest-report
+    type: llm
+    criteria: |
+      PASS if the reply states the planned frame size, makes clear nothing was rendered yet (dry run),
+      and gives a rough time or cost expectation for the real render.
+      FAIL if it claims a video was produced or omits the frame size.

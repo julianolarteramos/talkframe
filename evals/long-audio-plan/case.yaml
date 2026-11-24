@@ -1,0 +1,33 @@
+schema_version: "1.1"
+name: long-audio-plan
+description: Audio over 60 s must be planned as more than one segment split at a pause; plan only.
+tags: [planning]
+context:
+  add_dirs: [fixtures]
+execution:
+  prompt: |
+    Can you make fixtures/presenter.jpg narrate fixtures/voice-long.mp3 as a talking-head video? Just do a dry run
+    first and save it under out/ so I can see how the job would be split before we pay for a GPU.
+  max_turns: 25
+  timeout_seconds: 600
+  allowed_tools: [Read, Glob, Grep, Skill]
+graders:
+  - name: skill-fired
+    type: tool_used
+    tool: Skill
+    input_match: '"skill"\s*:\s*"(?:[\w-]+:)?talkframe"'
+    arm: with-only
+  - name: dry-run-used
+    type: tool_used
+    tool: Bash
+    input_match: "--dry-run"
+  - name: two-segments
+    type: regex
+    pattern: '"segments":\s*2'
+    target: { source: file, path: "out/**/plan.json" }
+    weight: 2
+  - name: explains-split
+    type: llm
+    criteria: |
+      PASS if the reply explains that the ~69 s audio will be rendered in 2 parts split at a pause and joined,
+      and that nothing has been rendered yet. FAIL otherwise.

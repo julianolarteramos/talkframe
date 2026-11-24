@@ -1,0 +1,12 @@
+{
+  "name": "talkframe",
+  "owner": { "name": "Julián Olarte", "url": "https://github.com/julianolarteramos" },
+  "description": "Marketplace for the talkframe plugin",
+  "plugins": [
+    {
+      "name": "talkframe",
+      "source": "./",
+      "description": "Turn a portrait photo and a voice recording into a lifelike talking video on a rented GPU."
+    }
+  ]
+}

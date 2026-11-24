@@ -1,0 +1,9 @@
+{
+  "name": "talkframe",
+  "version": "0.1.0",
+  "description": "Turn a portrait photo and a voice recording into a lifelike talking video (InfiniteTalk on a rented GPU: Google Colab, an SSH GPU box, or a local NVIDIA GPU).",
+  "author": { "name": "Julián Olarte", "url": "https://github.com/julianolarteramos" },
+  "license": "Apache-2.0",
+  "repository": "https://github.com/julianolarteramos/talkframe",
+  "keywords": ["talking-head", "lip-sync", "avatar", "infinitetalk", "wan", "comfyui", "colab", "video"]
+}

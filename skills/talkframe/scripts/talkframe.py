@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""talkframe: turn a portrait image + a voice track into a talking video (InfiniteTalk on a rented GPU).
+
+Subcommands
+  check     verify local tools and the chosen backend (no GPU time is spent)
+  generate  plan, render on the backend, stitch, and write <out>.mp4 + <out>.report.json
+
+Backends
+  colab   Google Colab via the official `colab` CLI (google-colab-cli). Needs Colab Pro/compute units.
+  ssh     any Linux host with an NVIDIA GPU and CUDA PyTorch, reached with `ssh user@host`.
+  local   this machine, if it has an NVIDIA GPU and CUDA PyTorch.
+
+Only the Python standard library plus ffmpeg/ffprobe are needed locally.
+"""
+import argparse
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REMOTE_JOB = os.path.join(HERE, "remote", "job.py")
+PIXELS = {480: 832 * 480, 720: 1280 * 720}
+DEFAULT_PROMPT = (
+    "A person speaks directly to the camera with natural, expressive facial expressions, subtle head movements and blinking, "
+    "gesturing naturally with their hands while explaining. Their hair moves slightly. Realistic, steady medium shot."
+)
+COLAB_REMOTE = "/content/talkframe"
+
+
+# ---------------------------------------------------------------- helpers
+def log(msg):
+    print(f"[talkframe] {msg}", flush=True)
+
+
+def run(cmd, check=True, capture=True, timeout=None):
+    r = subprocess.run(cmd, capture_output=capture, text=True, timeout=timeout)
+    if check and r.returncode:
+        raise SystemExit(f"command failed ({r.returncode}): {' '.join(map(str, cmd))[:200]}\n{(r.stderr or '')[-2000:]}")
+    return r
+
+
+def probe(path):
+    r = run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,width,height", "-show_entries", "format=duration",
+             "-of", "json", path])
+    return json.loads(r.stdout)
+
+
+def image_size(path):
+    for s in probe(path).get("streams", []):
+        if s.get("codec_type") == "video" and s.get("width"):
+            return s["width"], s["height"]
+    raise SystemExit(f"not an image: {path}")
+
+
+def audio_duration(path):
+    d = float(probe(path).get("format", {}).get("duration") or 0)
+    if d <= 0:
+        raise SystemExit(f"no audio duration: {path}")
+    return d
+
+
+def target_size(w, h, resolution):
+    """Keep the image's aspect ratio, ~same pixel count as the model's training bucket, multiples of 16."""
+    aspect = w / h
+    tw = math.sqrt(PIXELS[resolution] * aspect)
+    th = tw / aspect
+    return int(round(tw / 16) * 16), int(round(th / 16) * 16)
+
+
+def silences(path):
+    r = run(["ffmpeg", "-hide_banner", "-i", path, "-af", "silencedetect=noise=-35dB:d=0.2", "-f", "null", "-"], check=False)
+    starts = [float(x) for x in re.findall(r"silence_start: ([\d.]+)", r.stderr)]
+    ends = [float(x) for x in re.findall(r"silence_end: ([\d.]+)", r.stderr)]
+    return [(s + e) / 2 for s, e in zip(starts, ends)]
+
+
+def cut_points(path, duration, max_seg):
+    """Split long audio at pauses so each piece is <= max_seg seconds (InfiniteTalk drifts in color past ~1 min)."""
+    if duration <= max_seg:
+        return []
+    mids, cuts, start = silences(path), [], 0.0
+    while duration - start > max_seg:
+        limit = start + max_seg
+        options = [m for m in mids if start + max_seg * 0.5 < m <= limit]
+        cut = max(options) if options else limit
+        cuts.append(round(cut, 3))
+        start = cut
+    return cuts
+
+
+# ---------------------------------------------------------------- planning
+def plan(args):
+    for p in (args.image, args.audio):
+        if not os.path.isfile(p):
+            raise SystemExit(f"file not found: {p}")
+    iw, ih = image_size(args.image)
+    if args.size:
+        w, h = (int(x) for x in args.size.lower().split("x"))
+        w, h = w // 16 * 16, h // 16 * 16
+    else:
+        w, h = target_size(iw, ih, args.resolution)
+    dur = audio_duration(args.audio)
+    cuts = cut_points(args.audio, dur, args.max_segment)
+    out = os.path.abspath(args.out)
+    work = os.path.abspath(args.workdir or (os.path.splitext(out)[0] + ".talkframe"))
+    os.makedirs(os.path.join(work, "in"), exist_ok=True)
+
+    ext = os.path.splitext(args.image)[1].lower() or ".png"
+    shutil.copy(args.image, os.path.join(work, "in", "image" + ext))
+    bounds = [0.0, *cuts, dur]
+    jobs = []
+    for i in range(len(bounds) - 1):
+        name = f"seg{i:03d}"
+        wav = os.path.join(work, "in", f"{name}.wav")
+        run(["ffmpeg", "-v", "error", "-y", "-i", args.audio, "-ss", str(bounds[i]), "-to", str(bounds[i + 1]),
+             "-ac", "1", "-ar", "24000", wav])
+        jobs.append({"name": name, "image": "image" + ext, "audio": f"{name}.wav", "prompt": args.prompt or DEFAULT_PROMPT,
+                     "width": w, "height": h, "steps": args.steps, "seed": args.seed, "audio_scale": args.audio_scale})
+    json.dump(jobs, open(os.path.join(work, "in", "jobs.json"), "w"), indent=1)
+    p = {"image": os.path.abspath(args.image), "image_size": [iw, ih], "audio": os.path.abspath(args.audio),
+         "audio_seconds": round(dur, 2), "output": out, "output_size": [w, h], "segments": len(jobs),
+         "cut_points": cuts, "dry_run": bool(args.dry_run), "backend": args.backend, "workdir": work, "prompt": args.prompt or DEFAULT_PROMPT}
+    json.dump(p, open(os.path.join(work, "plan.json"), "w"), indent=1)
+    return p, jobs, work
+
+
+# ---------------------------------------------------------------- backends
+class Colab:
+    def __init__(self, args):
+        self.gpu, self.keep, self.attempts = args.gpu, args.keep, args.gpu_attempts
+        self.s = f"talkframe-{time.strftime('%H%M%S')}"
+
+    def c(self, *a, **kw):
+        return run(["colab", "--auth", "adc", *a], **kw)
+
+    def balance(self):
+        r = self.c("usage", check=False)
+        m = re.search(r"balance:\s*([\d.]+)", r.stdout + r.stderr)
+        return float(m.group(1)) if m else None
+
+    def check(self):
+        if not shutil.which("colab"):
+            return ["`colab` CLI not found: uv tool install google-colab-cli"]
+        r = self.c("whoami", check=False)
+        if r.returncode or "Email" not in r.stdout:
+            return ["colab auth failed; run: gcloud auth application-default login --scopes=openid,"
+                    "https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email,"
+                    "https://www.googleapis.com/auth/colaboratory"]
+        b = self.balance()
+        log(f"colab account ok, balance {b} compute units")
+        return [] if (b or 0) >= 2 else [f"low Colab balance ({b} units); an A100 burns ~8/h"]
+
+    def start(self):
+        for i in range(self.attempts):
+            self.c("new", "-s", self.s, "--gpu", self.gpu, check=False, timeout=600)
+            if f"[{self.s}]" in self.c("sessions", check=False).stdout:
+                log(f"colab session {self.s} ({self.gpu})")
+                return
+            log(f"no {self.gpu} available, retry {i + 1}/{self.attempts} in 60s")
+            time.sleep(60)
+        raise SystemExit(f"could not get a Colab {self.gpu}; try later or --gpu H100/L4")
+
+    def run_job(self, work, jobs):
+        p = subprocess.run(["colab", "--auth", "adc", "exec", "-s", self.s],
+                           input=f"import os; os.makedirs('{COLAB_REMOTE}/in', exist_ok=True)", text=True, capture_output=True)
+        if p.returncode:
+            raise SystemExit(f"colab exec failed: {p.stderr[-1500:]}")
+        files = [os.path.join(work, "in", f) for f in os.listdir(os.path.join(work, "in"))]
+        for f in files:
+            self.c("upload", "-s", self.s, f, f"{COLAB_REMOTE}/in/{os.path.basename(f)}", timeout=900)
+        self.c("upload", "-s", self.s, REMOTE_JOB, f"{COLAB_REMOTE}/job.py", timeout=300)
+        # exec keeps the kernel busy, so Colab does not reclaim the VM as idle; --timeout 0 allows long silent phases
+        subprocess.run(["colab", "--auth", "adc", "exec", "-s", self.s, "--timeout", "0", "-f", REMOTE_JOB])
+        os.makedirs(os.path.join(work, "out"), exist_ok=True)
+        for name in [j["name"] for j in jobs] + ["remote_report"]:
+            ext = ".json" if name == "remote_report" else ".mp4"
+            self.c("download", "-s", self.s, f"{COLAB_REMOTE}/out/{name}{ext}", os.path.join(work, "out", name + ext),
+                   check=False, timeout=900)
+
+    def stop(self):
+        if self.keep:
+            log(f"leaving session {self.s} running (--keep); stop it with: colab stop -s {self.s}")
+        else:
+            self.c("stop", "-s", self.s, check=False)
+
+
+class Ssh:
+    def __init__(self, args):
+        if not args.host:
+            raise SystemExit("--host user@machine is required for the ssh backend")
+        self.host, self.py, self.rdir = args.host, args.remote_python, args.remote_dir
+
+    def ssh(self, cmd, **kw):
+        return run(["ssh", "-o", "BatchMode=yes", self.host, cmd], **kw)
+
+    def check(self):
+        r = self.ssh(f"{self.py} -c 'import torch;print(torch.cuda.is_available(), torch.cuda.get_device_name(0))'",
+                     check=False, timeout=120)
+        if r.returncode or "True" not in r.stdout:
+            return [f"{self.host}: CUDA PyTorch not usable with {self.py} ({(r.stderr or r.stdout).strip()[-300:]})"]
+        log(f"{self.host}: {r.stdout.strip()}")
+        return []
+
+    def start(self):
+        self.ssh(f"mkdir -p {self.rdir}/in {self.rdir}/out")
+
+    def run_job(self, work, jobs):
+        files = [os.path.join(work, "in", f) for f in os.listdir(os.path.join(work, "in"))]
+        run(["scp", "-q", *files, f"{self.host}:{self.rdir}/in/"])
+        run(["scp", "-q", REMOTE_JOB, f"{self.host}:{self.rdir}/job.py"])
+        subprocess.run(["ssh", "-o", "BatchMode=yes", self.host,
+                        f"cd {self.rdir} && {self.py} job.py --workdir {shlex.quote(self.rdir)}"])
+        os.makedirs(os.path.join(work, "out"), exist_ok=True)
+        run(["scp", "-q", f"{self.host}:{self.rdir}/out/*", os.path.join(work, "out") + "/"], check=False)
+
+    def stop(self):
+        pass
+
+
+class Local:
+    def __init__(self, args):
+        self.py = args.remote_python
+
+    def check(self):
+        r = run([self.py, "-c", "import torch;print(torch.cuda.is_available())"], check=False)
+        return [] if "True" in r.stdout else ["no CUDA PyTorch on this machine; use --backend colab or ssh"]
+
+    def start(self):
+        pass
+
+    def run_job(self, work, jobs):
+        subprocess.run([self.py, REMOTE_JOB, "--workdir", work])
+
+    def stop(self):
+        pass
+
+
+BACKENDS = {"colab": Colab, "ssh": Ssh, "local": Local}
+
+
+# ---------------------------------------------------------------- stitching
+def stitch(p, jobs, work):
+    parts = [os.path.join(work, "out", j["name"] + ".mp4") for j in jobs]
+    missing = [x for x in parts if not os.path.isfile(x)]
+    if missing:
+        raise SystemExit(f"backend did not return: {', '.join(map(os.path.basename, missing))} (see the log above)")
+    lst = os.path.join(work, "out", "parts.txt")
+    with open(lst, "w") as f:
+        f.writelines(f"file '{x}'\n" for x in parts)
+    # concatenate the rendered picture, then lay the untouched original audio over it (no seams in the sound)
+    run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-i", p["audio"], "-map", "0:v", "-map", "1:a",
+         "-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-shortest",
+         "-movflags", "+faststart", p["output"]])
+
+
+# ---------------------------------------------------------------- commands
+def add_common(ap):
+    ap.add_argument("--backend", choices=BACKENDS, default="colab")
+    ap.add_argument("--gpu", default="A100", help="colab GPU: A100 (default), H100, L4")
+    ap.add_argument("--gpu-attempts", type=int, default=10, help="colab: retries when no GPU is free (1/min)")
+    ap.add_argument("--host", help="ssh backend: user@host")
+    ap.add_argument("--remote-dir", default="talkframe-work", help="ssh backend: working dir on the host")
+    ap.add_argument("--remote-python", default="python3", help="python with CUDA torch (ssh/local backends)")
+
+
+def cmd_check(args):
+    problems = []
+    for tool in ("ffmpeg", "ffprobe"):
+        if not shutil.which(tool):
+            problems.append(f"{tool} not found")
+    problems += BACKENDS[args.backend](args).check()
+    for x in problems:
+        log(f"PROBLEM: {x}")
+    log("check ok" if not problems else "check failed")
+    return 1 if problems else 0
+
+
+def cmd_generate(args):
+    t0 = time.time()
+    p, jobs, work = plan(args)
+    log(f"plan: {p['audio_seconds']}s audio -> {len(jobs)} segment(s), {p['output_size'][0]}x{p['output_size'][1]}, "
+        f"backend {args.backend}, workdir {work}")
+    if args.dry_run:
+        log(f"dry run: wrote {os.path.join(work, 'plan.json')} and in/jobs.json; nothing was rendered")
+        print(json.dumps(p, indent=1))
+        return 0
+    be = BACKENDS[args.backend](args)
+    before = be.balance() if isinstance(be, Colab) else None
+    be.start()
+    try:
+        be.run_job(work, jobs)
+    finally:
+        be.stop()
+    stitch(p, jobs, work)
+    rr = os.path.join(work, "out", "remote_report.json")
+    remote = json.load(open(rr)) if os.path.isfile(rr) else {}
+    after = be.balance() if isinstance(be, Colab) else None
+    report = {**p, "wall_seconds": round(time.time() - t0), "gpu": remote.get("gpu"),
+              "render_seconds": sum(j["render_seconds"] for j in remote.get("jobs", [])) or None,
+              "colab_units_used": round(before - after, 2) if before is not None and after is not None else None}
+    rep_path = os.path.splitext(p["output"])[0] + ".report.json"
+    json.dump(report, open(rep_path, "w"), indent=1)
+    log(f"DONE {p['output']} ({report['wall_seconds']}s wall, units {report['colab_units_used']}) report: {rep_path}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("check", help="verify tools and backend access")
+    add_common(c)
+    g = sub.add_parser("generate", help="render a talking video")
+    add_common(g)
+    g.add_argument("--image", required=True, help="portrait photo (any orientation)")
+    g.add_argument("--audio", required=True, help="voice track (wav/mp3/m4a...)")
+    g.add_argument("--out", required=True, help="output .mp4 path")
+    g.add_argument("--prompt", help="English scene description; see references/prompting.md")
+    g.add_argument("--resolution", type=int, choices=(480, 720), default=480)
+    g.add_argument("--size", help="exact WxH instead of --resolution (rounded down to multiples of 16)")
+    g.add_argument("--steps", type=int, default=6)
+    g.add_argument("--seed", type=int, default=2)
+    g.add_argument("--audio-scale", type=float, default=1.0, help="raise (1.2-1.5) for stronger lip motion")
+    g.add_argument("--max-segment", type=float, default=60.0, help="split audio longer than this (seconds) at pauses")
+    g.add_argument("--workdir", help="where inputs/parts are kept (default: <out>.talkframe/)")
+    g.add_argument("--keep", action="store_true", help="colab: leave the VM running after the job")
+    g.add_argument("--dry-run", action="store_true", help="plan only: write plan.json/jobs.json, no GPU")
+    args = ap.parse_args()
+    for tool in ("ffmpeg", "ffprobe"):
+        if not shutil.which(tool):
+            raise SystemExit(f"{tool} is required")
+    sys.exit(cmd_check(args) if args.cmd == "check" else cmd_generate(args))
+
+
+if __name__ == "__main__":
+    main()
