@@ -37,6 +37,7 @@ The heavy lifting happens on a GPU machine. `scripts/talkframe.py` plans the job
    ```
    - Add `--dry-run` to only plan. It writes `plan.json` and `in/jobs.json` next to the output and spends no GPU time. Use it to show the user the plan, or when they only asked what would happen.
    - Audio longer than 60 s is split at pauses into ≤60 s segments, because InfiniteTalk's colors drift on very long takes. Each segment restarts from the photo, and the original audio is laid back over the joined picture, so the sound has no seams.
+   - Each rendered part is padded to its exact audio length before joining, because the model returns a few frames short. That keeps later segments in sync and the last word intact.
    - Timing on a Colab A100:
      - A fresh VM spends ~5 min installing and downloading.
      - Rendering then takes ~20–25 s per second of video at 480p.
@@ -60,6 +61,17 @@ The heavy lifting happens on a GPU machine. `scripts/talkframe.py` plans the job
 | Face changes identity over a long clip | `--max-segment 30` |
 | A different take of the same clip | `--seed <n>` |
 | Softness | `--resolution 720`, or `--steps 8` |
+| Logo or text in the photo wobbles (mic flag, sign, printed name) | `--protect-region X,Y,W,H` (photo pixels; see below) |
+| Mouth hangs open during pauses | Already handled: silences get a quiet noise floor before the model. `--no-noise-floor` turns it off for comparison. |
+
+### Keeping a logo exact
+
+The model redraws every pixel, so small text such as a microphone flag's logo drifts from frame to frame. `--protect-region` tracks a flat area through the video and pastes the photo's original pixels back, relit per frame and feathered at the edges (`scripts/protect.py`, OpenCV ECC homography). Frames where tracking is unsure, such as a hand passing in front, are left as generated.
+
+1. Find the box in the photo's own pixel coordinates. Look at the image, or threshold the bright card with OpenCV.
+2. Include the whole card or sign, not just the letters. The edges are what make tracking stable.
+3. The step needs `numpy` and `opencv-python-headless` locally. Point `--protect-python` at a Python that has them.
+4. Check the result: crop the region from a few frames, side by side.
 
 ## When things fail
 

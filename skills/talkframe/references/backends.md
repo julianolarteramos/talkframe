@@ -19,7 +19,7 @@ colab --auth adc usage                     # shows the compute-unit balance
 - **Account:** the Google account must be the one holding the Colab subscription.
 
 What talkframe does on each run:
-1. `colab new --gpu A100`, retrying every minute (`--gpu-attempts`) while none is free.
+1. `colab new` with the first free GPU from `--gpu` (default `A100,H100`), retrying every minute (`--gpu-attempts`).
 2. Uploads inputs and `job.py`.
 3. Runs it with `colab exec --timeout 0`.
 4. Downloads the parts and stops the VM, even on failure.

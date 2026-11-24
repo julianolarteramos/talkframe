@@ -119,13 +119,20 @@ def plan(args):
     for i in range(len(bounds) - 1):
         name = f"seg{i:03d}"
         wav = os.path.join(work, "in", f"{name}.wav")
-        run(["ffmpeg", "-v", "error", "-y", "-i", args.audio, "-ss", str(bounds[i]), "-to", str(bounds[i + 1]),
-             "-ac", "1", "-ar", "24000", wav])
+        # The model only hears this copy; the final video keeps the original audio. Pure digital silence (exact zeros,
+        # typical between edited clips) makes InfiniteTalk open the mouth wide during pauses, so a pink-noise floor (~-57 dBFS RMS)
+        # is mixed in. That is about the level of quiet room tone; under speech it is inaudible to the model.
+        noise = "" if args.no_noise_floor else \
+            ";anoisesrc=color=pink:amplitude=0.008:sample_rate=24000[n];[v][n]amix=inputs=2:duration=first:normalize=0"
+        run(["ffmpeg", "-v", "error", "-y", "-i", args.audio, "-filter_complex",
+             f"[0:a]atrim={bounds[i]}:{bounds[i + 1]},asetpts=N/SR/TB,aformat=channel_layouts=mono,aresample=24000[v]{noise}",
+             *([] if noise else ["-map", "[v]"]), "-ar", "24000", wav])
         jobs.append({"name": name, "image": "image" + ext, "audio": f"{name}.wav", "prompt": args.prompt or DEFAULT_PROMPT,
-                     "width": w, "height": h, "steps": args.steps, "seed": args.seed, "audio_scale": args.audio_scale})
+                     "width": w, "height": h, "steps": args.steps, "seed": args.seed, "audio_scale": args.audio_scale,
+                     "seconds": round(bounds[i + 1] - bounds[i], 3)})
     json.dump(jobs, open(os.path.join(work, "in", "jobs.json"), "w"), indent=1)
     p = {"image": os.path.abspath(args.image), "image_size": [iw, ih], "audio": os.path.abspath(args.audio),
-         "audio_seconds": round(dur, 2), "output": out, "output_size": [w, h], "segments": len(jobs),
+         "audio_seconds": round(dur, 2), "audio_seconds_exact": dur, "output": out, "output_size": [w, h], "segments": len(jobs),
          "cut_points": cuts, "dry_run": bool(args.dry_run), "backend": args.backend, "workdir": work, "prompt": args.prompt or DEFAULT_PROMPT}
     json.dump(p, open(os.path.join(work, "plan.json"), "w"), indent=1)
     return p, jobs, work
@@ -158,14 +165,21 @@ class Colab:
         return [] if (b or 0) >= 2 else [f"low Colab balance ({b} units); an A100 burns ~8/h"]
 
     def start(self):
+        # --gpu may list fallbacks ("A100,H100,L4"): each attempt tries the next one, so a busy pool doesn't block the run
+        gpus = [g.strip().upper() for g in self.gpu.split(",") if g.strip()]
         for i in range(self.attempts):
-            self.c("new", "-s", self.s, "--gpu", self.gpu, check=False, timeout=600)
+            gpu = gpus[i % len(gpus)]
+            try:
+                self.c("new", "-s", self.s, "--gpu", gpu, check=False, timeout=300)
+            except subprocess.TimeoutExpired:
+                pass
             if f"[{self.s}]" in self.c("sessions", check=False).stdout:
-                log(f"colab session {self.s} ({self.gpu})")
+                log(f"colab session {self.s} ({gpu})")
                 return
-            log(f"no {self.gpu} available, retry {i + 1}/{self.attempts} in 60s")
-            time.sleep(60)
-        raise SystemExit(f"could not get a Colab {self.gpu}; try later or --gpu H100/L4")
+            if i + 1 < self.attempts:
+                log(f"no {gpu} available, attempt {i + 1}/{self.attempts}; retrying in 60s")
+                time.sleep(60)
+        raise SystemExit(f"could not get a Colab GPU ({self.gpu}) after {self.attempts} attempts; try later")
 
     def run_job(self, work, jobs):
         p = subprocess.run(["colab", "--auth", "adc", "exec", "-s", self.s],
@@ -251,19 +265,23 @@ def stitch(p, jobs, work):
     missing = [x for x in parts if not os.path.isfile(x)]
     if missing:
         raise SystemExit(f"backend did not return: {', '.join(map(os.path.basename, missing))} (see the log above)")
-    lst = os.path.join(work, "out", "parts.txt")
-    with open(lst, "w") as f:
-        f.writelines(f"file '{x}'\n" for x in parts)
-    # concatenate the rendered picture, then lay the untouched original audio over it (no seams in the sound)
-    run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-i", p["audio"], "-map", "0:v", "-map", "1:a",
-         "-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-shortest",
-         "-movflags", "+faststart", p["output"]])
+    # InfiniteTalk returns a few frames less than its audio (25 fps windows). Each part is padded with its last frame
+    # and trimmed to exactly its audio segment's length, so later segments stay in sync and the end of the voice
+    # isn't cut off. Then the untouched original audio goes over the joined picture (no seams in the sound).
+    ins, chains = [], []
+    for k, (x, j) in enumerate(zip(parts, jobs)):
+        ins += ["-i", x]
+        chains.append(f"[{k}:v]tpad=stop_mode=clone:stop_duration=2,trim=duration={j['seconds']},setpts=PTS-STARTPTS[v{k}]")
+    graph = ";".join(chains) + ";" + "".join(f"[v{k}]" for k in range(len(parts))) + f"concat=n={len(parts)}:v=1:a=0[v]"
+    run(["ffmpeg", "-v", "error", "-y", *ins, "-i", p["audio"], "-filter_complex", graph,
+         "-map", "[v]", "-map", f"{len(parts)}:a", "-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-b:a", "192k", "-t", str(p["audio_seconds_exact"]), "-movflags", "+faststart", p["output"]])
 
 
 # ---------------------------------------------------------------- commands
 def add_common(ap):
     ap.add_argument("--backend", choices=BACKENDS, default="colab")
-    ap.add_argument("--gpu", default="A100", help="colab GPU: A100 (default), H100, L4")
+    ap.add_argument("--gpu", default="A100,H100", help="colab GPU or comma list of fallbacks: A100, H100, L4 (default A100,H100)")
     ap.add_argument("--gpu-attempts", type=int, default=10, help="colab: retries when no GPU is free (1/min)")
     ap.add_argument("--host", help="ssh backend: user@host")
     ap.add_argument("--remote-dir", default="talkframe-work", help="ssh backend: working dir on the host")
@@ -299,6 +317,17 @@ def cmd_generate(args):
     finally:
         be.stop()
     stitch(p, jobs, work)
+    if args.protect_region:
+        # optional: paste the photo's exact pixels back over a flat detail (logo card, sign) that the model redraws
+        raw = os.path.splitext(p["output"])[0] + ".raw.mp4"
+        os.replace(p["output"], raw)
+        r = subprocess.run([args.protect_python, os.path.join(HERE, "protect.py"), "--video", raw, "--image", p["image"],
+                            "--region", args.protect_region, "--out", p["output"]])
+        if r.returncode:
+            os.replace(raw, p["output"])
+            log("protect-region failed; kept the unprotected video (see message above)")
+        else:
+            os.remove(raw)
     rr = os.path.join(work, "out", "remote_report.json")
     remote = json.load(open(rr)) if os.path.isfile(rr) else {}
     after = be.balance() if isinstance(be, Colab) else None
@@ -329,6 +358,9 @@ def main():
     g.add_argument("--audio-scale", type=float, default=1.0, help="raise (1.2-1.5) for stronger lip motion")
     g.add_argument("--max-segment", type=float, default=60.0, help="split audio longer than this (seconds) at pauses")
     g.add_argument("--workdir", help="where inputs/parts are kept (default: <out>.talkframe/)")
+    g.add_argument("--protect-region", help="X,Y,W,H in photo pixels of a flat logo/sign to keep pixel-exact (needs numpy+opencv)")
+    g.add_argument("--protect-python", default=sys.executable, help="python that has numpy+opencv for --protect-region")
+    g.add_argument("--no-noise-floor", action="store_true", help="send the audio to the model as-is (no noise floor in silences)")
     g.add_argument("--keep", action="store_true", help="colab: leave the VM running after the job")
     g.add_argument("--dry-run", action="store_true", help="plan only: write plan.json/jobs.json, no GPU")
     args = ap.parse_args()
