@@ -163,6 +163,8 @@ def plan(args):
         jobs.append({"name": name, "image": "image" + ext, "audio": f"{name}.wav", "prompt": args.prompt or DEFAULT_PROMPT,
                      "width": w, "height": h, "steps": args.steps, "seed": args.seed, "audio_scale": args.audio_scale,
                      "seconds": round(bounds[i + 1] - bounds[i], 3),
+                     "attention": args.attention,
+                     "quantization": "fp8_e4m3fn_scaled_fast" if args.fp8_fast else "fp8_e4m3fn_scaled",
                      # whole frames this part must fill, from absolute frame positions so rounding never accumulates
                      "frames": round(bounds[i + 1] * FPS) - round(bounds[i] * FPS)})
     json.dump(jobs, open(os.path.join(work, "in", "jobs.json"), "w"), indent=1)
@@ -244,16 +246,23 @@ class Colab:
         sys.exit(EXIT_NO_GPU)
 
     def run_job(self, work, jobs):
+        # one upload (inputs + job.py in a tarball) instead of one `colab upload` round trip per file
+        import tarfile
+        bundle = os.path.join(work, "bundle.tgz")
+        with tarfile.open(bundle, "w:gz") as tf:
+            tf.add(os.path.join(work, "in"), arcname="in")
+            tf.add(REMOTE_JOB, arcname="job.py")
         p = subprocess.run(["colab", "--auth", "adc", "exec", "-s", self.s],
                            input=(f"import os, glob\nfor d in ('in', 'out'):\n    os.makedirs('{COLAB_REMOTE}/' + d, exist_ok=True)\n"
                                   f"    [os.remove(f) for f in glob.glob('{COLAB_REMOTE}/' + d + '/*') if os.path.isfile(f)]\n"),
                            text=True, capture_output=True)
         if p.returncode:
             raise SystemExit(f"colab exec failed: {p.stderr[-1500:]}")
-        files = [os.path.join(work, "in", f) for f in os.listdir(os.path.join(work, "in"))]
-        for f in files:
-            self.c("upload", "-s", self.s, f, f"{COLAB_REMOTE}/in/{os.path.basename(f)}", timeout=900)
-        self.c("upload", "-s", self.s, REMOTE_JOB, f"{COLAB_REMOTE}/job.py", timeout=300)
+        self.c("upload", "-s", self.s, bundle, f"{COLAB_REMOTE}/bundle.tgz", timeout=900)
+        p = subprocess.run(["colab", "--auth", "adc", "exec", "-s", self.s], text=True, capture_output=True,
+                           input=f"import tarfile\ntarfile.open('{COLAB_REMOTE}/bundle.tgz').extractall('{COLAB_REMOTE}')\n")
+        if p.returncode:
+            raise SystemExit(f"colab exec (unpack) failed: {p.stderr[-1500:]}")
         # exec keeps the kernel busy, so Colab does not reclaim the VM as idle; --timeout 0 allows long silent phases
         rc = subprocess.run(["colab", "--auth", "adc", "exec", "-s", self.s, "--timeout", "0", "-f", REMOTE_JOB]).returncode
         if rc:
@@ -455,6 +464,20 @@ def stitch(p, jobs, work):
          "-c:a", "aac", "-b:a", "192k", "-t", str(p["audio_seconds_exact"]), "-movflags", "+faststart", p["output"]])
 
 
+def fingerprint(args):
+    """Hash of everything that changes the rendered picture: same hash means the existing video is the same result."""
+    import hashlib
+    h = hashlib.sha256()
+    for path in (args.image, args.audio):
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    for k in ("prompt", "resolution", "size", "steps", "seed", "audio_scale", "max_segment", "crop_y", "video_delay",
+              "no_noise_floor", "protect_region", "attention", "fp8_fast"):
+        h.update(f"{k}={getattr(args, k, None)}|".encode())
+    return h.hexdigest()[:16]
+
+
 def protect_python():
     """A Python that has numpy + OpenCV: this one if it does, else a throwaway env from `uv` (cached after first use)."""
     ok = subprocess.run([sys.executable, "-c", "import cv2, numpy"], capture_output=True).returncode == 0
@@ -501,7 +524,19 @@ def cmd_generate(args):
     if args.protect_region and not args.dry_run:
         # resolve it before spending GPU time, so a missing OpenCV can't strand a finished render
         args.protect_cmd = [args.protect_python] if args.protect_python else protect_python()
+    fp = fingerprint(args)
+    rep_path = os.path.splitext(os.path.abspath(args.out))[0] + ".report.json"
+    if not args.dry_run and not args.force and os.path.isfile(args.out) and os.path.isfile(rep_path):
+        try:
+            same = json.load(open(rep_path)).get("fingerprint") == fp
+        except ValueError:
+            same = False
+        if same:
+            # one render per reel: retries and later edits reuse this video instead of paying for the GPU again
+            log(f"already rendered from these exact inputs: {args.out} (pass --force to render again)")
+            return 0
     p, jobs, work = plan(args)
+    p["fingerprint"] = fp
     log(f"plan: {p['audio_seconds']}s audio -> {len(jobs)} segment(s), {p['output_size'][0]}x{p['output_size'][1]}, "
         f"backend {args.backend}, workdir {work}")
     if args.dry_run:
@@ -548,7 +583,6 @@ def cmd_generate(args):
               "render_seconds": sum(j["render_seconds"] for j in remote.get("jobs", [])) or None,
               "colab_units_used": used if isinstance(be, Colab) else None,
               "runpod_usd_estimate": be.cost_usd() if isinstance(be, Runpod) else None}
-    rep_path = os.path.splitext(p["output"])[0] + ".report.json"
     json.dump(report, open(rep_path, "w"), indent=1)
     cost = (f"units {report['colab_units_used']}" if isinstance(be, Colab) else
             f"~US${report['runpod_usd_estimate']}" if isinstance(be, Runpod) else "local")
@@ -569,7 +603,13 @@ def main():
     g.add_argument("--prompt", help="English scene description; see references/prompting.md")
     g.add_argument("--resolution", type=int, choices=(480, 720), default=480)
     g.add_argument("--size", help="exact WxH instead of --resolution (rounded down to multiples of 16)")
-    g.add_argument("--steps", type=int, default=6)
+    g.add_argument("--steps", type=int, default=6, help="sampling steps (the lightx2v LoRA is distilled for 4-8)")
+    g.add_argument("--attention", choices=("sdpa", "sageattn"), default="sdpa",
+                   help="attention kernel; sageattn installs SageAttention on the GPU machine")
+    g.add_argument("--fp8-fast", action="store_true",
+                   help="fp8 matmuls on GPUs that have them (L40S, RTX 6000 Ada, H100); no gain on A100")
+    g.add_argument("--force", action="store_true",
+                   help="render again even if --out already holds a video made from the same inputs")
     g.add_argument("--seed", type=int, default=2)
     g.add_argument("--audio-scale", type=float, default=1.0, help="raise (1.2-1.5) for stronger lip motion")
     g.add_argument("--max-segment", type=float, default=60.0, help="split audio longer than this (seconds) at pauses")

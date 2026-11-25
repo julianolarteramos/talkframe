@@ -114,23 +114,47 @@ def setup_comfy(comfy):
     open(marker, "w").write(time.strftime("%Y-%m-%d %H:%M:%S\n"))  # only now is the install complete
 
 
-def download_models(comfy):
-    # the models are public; without this, huggingface_hub on Colab waits ~10 s for a notebook secret that never comes
+def download_models(workdir):
+    """Fetch the model set into <workdir>/models, several files at once. It runs in a thread while ComfyUI installs,
+    so it lives outside the ComfyUI folder (an unfinished install gets wiped and redone)."""
+    # public models: without this, huggingface_hub on Colab waits ~10 s for a notebook secret that never comes
     os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
-    if not _has("huggingface_hub"):
-        pip_install("huggingface_hub")
+    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")  # faster Xet transfers (more parallel chunks)
+    from concurrent.futures import ThreadPoolExecutor
     from huggingface_hub import hf_hub_download
 
     t0 = time.time()
-    cache = os.path.join(os.path.dirname(comfy), "hf-download")
+    cache = os.path.join(workdir, "hf-download")
+
+    def get(item):
+        repo, path, sub = item
+        dst = f"{workdir}/models/{sub}/{os.path.basename(path)}"
+        if not os.path.exists(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.replace(hf_hub_download(repo, path, local_dir=cache), dst)
+        return dst
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        list(ex.map(get, MODELS))
+    log(f"models ready ({time.time() - t0:.0f}s)")
+
+
+def link_models(comfy, workdir):
+    """Expose <workdir>/models inside ComfyUI's models/ tree (symlinks, so nothing is copied)."""
     for repo, path, sub in MODELS:
+        src = f"{workdir}/models/{sub}/{os.path.basename(path)}"
         dst = f"{comfy}/models/{sub}/{os.path.basename(path)}"
         if os.path.exists(dst):
             continue
-        log(f"downloading {os.path.basename(path)}")
         os.makedirs(os.path.dirname(dst), exist_ok=True)
-        os.replace(hf_hub_download(repo, path, local_dir=cache), dst)
-    log(f"models ready ({time.time() - t0:.0f}s)")
+        os.symlink(src, dst)
+
+
+def _capture(errs, fn, *a):
+    try:
+        fn(*a)
+    except BaseException as e:  # reported by the main thread
+        errs.append(repr(e))
 
 
 def _has(mod):
@@ -206,7 +230,8 @@ def build_graph(job, image_name, audio_name):
             "model": "WanVideo/InfiniteTalk/Wan2_1-InfiniteTalk-Single_fp8_e4m3fn_scaled_KJ.safetensors"}},
         "model": {"class_type": "WanVideoModelLoader", "inputs": {
             "model": "WanVideo/Wan2_1-I2V-14B-480p_fp8_e4m3fn_scaled_KJ.safetensors", "base_precision": "bf16",
-            "quantization": "fp8_e4m3fn_scaled", "load_device": "main_device", "attention_mode": "sdpa",
+            "quantization": job.get("quantization", "fp8_e4m3fn_scaled"), "load_device": "main_device",
+            "attention_mode": job.get("attention", "sdpa"),
             "lora": ["lora", 0], "multitalk_model": ["mt", 0]}},
         "vae": {"class_type": "WanVideoVAELoader", "inputs": {"model_name": "Wan2_1_VAE_bf16.safetensors", "precision": "bf16"}},
         "clipv": {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": "clip_vision_h.safetensors"}},
@@ -298,8 +323,23 @@ def main():
         raise SystemExit("No CUDA GPU visible to PyTorch.")
     log(f"GPU: {torch.cuda.get_device_name(0)}, torch {torch.__version__}")
 
+    # download the ~38 GB of models while ComfyUI and its dependencies install (they don't depend on each other)
+    if not _has("huggingface_hub"):
+        pip_install("huggingface_hub")
+    import threading
+    dl_err = []
+    dl = threading.Thread(target=lambda: _capture(dl_err, download_models, workdir), daemon=True)
+    dl.start()
     setup_comfy(comfy)
-    download_models(comfy)
+    extra = {j.get("attention") for j in json.load(open(f"{workdir}/in/jobs.json"))}
+    if "sageattn" in extra and not _has("sageattention"):
+        pip_install("sageattention==1.0.6")
+    while dl.is_alive():
+        log("still downloading models...")
+        dl.join(25)
+    if dl_err:
+        raise SystemExit(f"model download failed: {dl_err[0]}")
+    link_models(comfy, workdir)
     start_comfy(comfy, workdir)
     jobs = json.load(open(f"{workdir}/in/jobs.json"))
     report = []
