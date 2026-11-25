@@ -22,7 +22,7 @@ What talkframe does on each run:
 1. `colab new` with the first free GPU from `--gpu` (default `A100,H100`), retrying every minute (`--gpu-attempts`).
 2. Uploads inputs and `job.py`.
 3. Runs it with `colab exec --timeout 0`.
-4. Downloads the parts and stops the VM, even on failure.
+4. Downloads the parts and stops the VM, even on failure or when killed with SIGTERM (exit 143).
 5. Compares the compute-unit balance before and after.
 
 `--keep` leaves the VM up. Pass its name to the next run with `--session <name>` and that run skips the install and the model download. Stop it at the end (a final run without `--keep`, or `colab --auth adc stop -s <name>`), because an idle VM still burns units and Colab may reclaim it anyway.

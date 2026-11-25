@@ -19,6 +19,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -393,6 +394,9 @@ def cmd_generate(args):
         print(json.dumps(p, indent=1))
         return 0
     be = BACKENDS[args.backend](args)
+    # A queue that kills talkframe on a timeout sends SIGTERM: turn it into a normal exit so the `finally` below still
+    # stops the Colab VM (otherwise it keeps billing until Colab reclaims it).
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     before = be.balance() if isinstance(be, Colab) else None
     out_dir = os.path.join(work, "out")
     shutil.rmtree(out_dir, ignore_errors=True)  # never stitch parts left over from an earlier run
