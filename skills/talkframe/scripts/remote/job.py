@@ -61,12 +61,22 @@ def sh(cmd, cwd=None):
     return r.stdout
 
 
+CONSTRAINTS = None  # set by setup_comfy: pins the machine's own torch/torchvision/torchaudio
+
+
 def pip_install(args):
-    py = sys.executable
-    if shutil.which("uv"):
-        sh(f"uv pip install --python {shlex.quote(py)} -q {args}")
-    else:
-        sh(f"{shlex.quote(py)} -m pip install -q {args}")
+    py = shlex.quote(sys.executable)
+    base = f"uv pip install --python {py} -q" if shutil.which("uv") else f"{py} -m pip install -q"
+    if CONSTRAINTS:
+        base += f" -c {shlex.quote(CONSTRAINTS)}"
+    r = subprocess.run(f"{base} {args}", shell=True, capture_output=True, text=True)
+    if r.returncode and "externally managed" in (r.stdout + r.stderr).lower():
+        # PEP 668 system Python (e.g. Ubuntu 24.04 images on RunPod): fine to override inside a throwaway GPU container
+        log("system Python is marked externally managed; installing with --break-system-packages")
+        sh(f"{base} --break-system-packages {args}")
+    elif r.returncode:
+        print(r.stdout[-2000:], r.stderr[-4000:], flush=True)
+        raise SystemExit(f"pip install failed: {args[:100]}")
 
 
 def setup_comfy(comfy):
@@ -78,6 +88,20 @@ def setup_comfy(comfy):
         log("found an unfinished ComfyUI install; starting it over")
         shutil.rmtree(comfy)
     q = shlex.quote
+    # Keep the GPU machine's CUDA build of torch: without this, a loose requirement can upgrade torch to a newer
+    # wheel while torchaudio/torchvision stay old, and torchaudio then fails with "undefined symbol" (seen on RunPod).
+    global CONSTRAINTS
+    import importlib.metadata as md
+    pins = []
+    for pkg in ("torch", "torchvision", "torchaudio"):
+        try:
+            pins.append(f"{pkg}=={md.version(pkg)}")
+        except md.PackageNotFoundError:
+            pass
+    CONSTRAINTS = os.path.join(os.path.dirname(comfy), "torch-constraints.txt")
+    os.makedirs(os.path.dirname(CONSTRAINTS), exist_ok=True)
+    open(CONSTRAINTS, "w").write("\n".join(pins) + "\n")
+    log("keeping " + ", ".join(pins))
     sh(f"git clone -q --depth 1 https://github.com/comfyanonymous/ComfyUI {q(comfy)}")
     for repo in NODE_REPOS:
         sh(f"git clone -q --depth 1 https://github.com/{repo} {q(comfy + '/custom_nodes/' + repo.split('/')[1])}")

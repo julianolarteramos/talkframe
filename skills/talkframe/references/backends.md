@@ -1,6 +1,6 @@
 # Backends: where the GPU comes from
 
-All three backends run the same `scripts/remote/job.py`. The GPU needs ≥24 GB of VRAM; the fp8 model peaks at ~24 GB at 480p. The job installs ComfyUI and the models on first use and skips those steps when they are already there.
+All backends run the same `scripts/remote/job.py`. The GPU needs ≥24 GB of VRAM; the fp8 model peaks at ~24 GB at 480p. The job installs ComfyUI and the models on first use and skips those steps when they are already there.
 
 ## colab (default): Google Colab via the official CLI
 
@@ -33,6 +33,31 @@ Colab specifics:
 - **GPU sizes:** the standard A100 VM has 40 GB VRAM, 83 GB RAM and ~235 GB disk. That's enough for 480p and 720p. `--gpu H100` is faster and costs more units per hour. `--gpu L4` (24 GB) works at 480p but is slower.
 - **Downloads:** Hugging Face downloads inside Colab run at roughly 300 MB/s, so the ~38 GB of models take a few minutes. Caching them in Drive isn't worth it, and mounting Drive needs an interactive consent anyway.
 
+## runpod: a fresh RunPod pod per run (no Colab needed)
+
+Use this when Colab has no GPU, or as the main backend. It needs only `runpodctl` and an API key: no MCP server and no browser login.
+
+One-time setup:
+
+```bash
+# runpodctl binary (Linux shown; also: brew install runpod/runpodctl/runpodctl)
+gh release download -R runpod/runpodctl --pattern 'runpodctl-linux-amd64' && install -m 755 runpodctl-linux-amd64 ~/.local/bin/runpodctl
+runpodctl config --apiKey <your RunPod API key>   # stores it in ~/.runpod/config.toml, creates and registers an SSH key
+runpodctl user                                    # shows the balance
+```
+
+What talkframe does on each run:
+1. Creates a Secure Cloud pod from `runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404` (CUDA PyTorch, Python 3.12, uv, git and ffmpeg preinstalled) with a 120 GB disk. It tries the GPUs in `--runpod-gpu` in order and moves to the next on "no instances available". Default order: L40S, RTX 6000 Ada, L40, RTX A6000, A100 80GB PCIe, A100 SXM.
+2. Waits for an SSH login and runs `job.py` like the ssh backend. Installing and downloading take a few minutes on every run, because the pod is fresh.
+3. Downloads the parts and **deletes the pod**: always, including on errors and SIGTERM, unless `--keep`.
+4. Writes `runpod_usd_estimate` (the pod's hourly price × time it lived) into the report.
+
+When none of the GPUs is free, it exits 75, like Colab.
+
+- **GPU size:** a 48 GB card (L40S, RTX 6000 Ada, A6000) is plenty at 480p. A100s are listed last because they cost more and aren't faster for this job.
+- **Seen 2026-11-25:** L40S out of stock, RTX 6000 Ada (48 GB) available at US$1.09/h in US-WA-1.
+- **API key scopes:** a key without `catalog:read` still works, because talkframe never lists the catalog. It just tries each GPU.
+
 ## ssh: any Linux box with an NVIDIA GPU
 
 Use this for a workstation, a cloud VM (RunPod, Lambda, Vast, Azure or GCP spot) or a lab server you can reach with key-based SSH.
@@ -47,7 +72,7 @@ python3 talkframe.py check --backend ssh --host user@gpu-box --remote-python ~/v
 python3 talkframe.py generate --backend ssh --host user@gpu-box --remote-python ~/venv/bin/python ...
 ```
 
-Files live in `~/talkframe-work` on the host (`--remote-dir`). The models stay there between runs, so only the first run pays for the download.
+Use `--ssh-port` and `--ssh-key` for hosts on a non-standard port or with a dedicated key, such as a RunPod pod you started by hand. Files live in `~/talkframe-work` on the host (`--remote-dir`). The models stay there between runs, so only the first run pays for the download.
 
 ## local: this machine has the GPU
 

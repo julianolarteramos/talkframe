@@ -279,9 +279,16 @@ class Ssh:
         if any(c.isspace() for c in self.rdir):
             raise SystemExit("--remote-dir must not contain spaces")
         self.qdir = shlex.quote(self.rdir) if not self.rdir.startswith("~/") else '"$HOME"/' + shlex.quote(self.rdir[2:])
+        self.opts = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ServerAliveInterval=30"]
+        if getattr(args, "ssh_key", None):
+            self.opts += ["-i", os.path.expanduser(args.ssh_key), "-o", "IdentitiesOnly=yes"]
+        self.port = str(getattr(args, "ssh_port", None) or 22)
 
     def ssh(self, cmd, **kw):
-        return run(["ssh", "-o", "BatchMode=yes", self.host, cmd], **kw)
+        return run(["ssh", *self.opts, "-p", self.port, self.host, cmd], **kw)
+
+    def scp(self, *a, **kw):
+        return run(["scp", "-q", *self.opts, "-P", self.port, *a], **kw)
 
     def check(self):
         r = self.ssh(f"{self.py} -c 'import torch;print(torch.cuda.is_available(), torch.cuda.get_device_name(0))'",
@@ -297,16 +304,108 @@ class Ssh:
 
     def run_job(self, work, jobs):
         files = [os.path.join(work, "in", f) for f in os.listdir(os.path.join(work, "in"))]
-        run(["scp", "-q", *files, f"{self.host}:{self.rdir}/in/"])
-        run(["scp", "-q", REMOTE_JOB, f"{self.host}:{self.rdir}/job.py"])
-        rc = subprocess.run(["ssh", "-o", "BatchMode=yes", self.host,
+        self.scp(*files, f"{self.host}:{self.rdir}/in/")
+        self.scp(REMOTE_JOB, f"{self.host}:{self.rdir}/job.py")
+        rc = subprocess.run(["ssh", *self.opts, "-p", self.port, self.host,
                              f"cd {self.qdir} && {self.py} job.py --workdir ."]).returncode
         if rc:
             raise SystemExit(f"remote job failed on {self.host} (exit {rc}); see the log above")
-        run(["scp", "-q", f"{self.host}:{self.rdir}/out/*", os.path.join(work, "out") + "/"], check=False)
+        self.scp(f"{self.host}:{self.rdir}/out/*", os.path.join(work, "out") + "/", check=False)
 
     def stop(self):
         pass
+
+
+class Runpod(Ssh):
+    """A fresh RunPod GPU pod per run, driven by `runpodctl` and the API key it stores (no MCP, no browser login).
+
+    Tries the GPUs in --runpod-gpu in order (stock changes minute to minute), waits for SSH, runs the same job as the
+    ssh backend, and always deletes the pod at the end, also on errors and SIGTERM, unless --keep."""
+
+    IMAGE = "runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404"  # CUDA torch, python 3.12, uv, git, ffmpeg, sshd
+
+    def __init__(self, args):
+        self.gpus = [g.strip() for g in args.runpod_gpu.split(",") if g.strip()]
+        self.keep = getattr(args, "keep", False)
+        self.cloud, self.disk = args.runpod_cloud, args.runpod_disk
+        self.py, self.rdir, self.qdir = "python3", "/root/talkframe-work", "/root/talkframe-work"
+        self.pod, self.cost_hr, self.t_start = None, None, None
+
+    def rp(self, *a, **kw):
+        return run(["runpodctl", *a], **kw)
+
+    def balance(self):
+        try:
+            return float(json.loads(self.rp("user", check=False).stdout).get("clientBalance"))
+        except Exception:
+            return None
+
+    def check(self):
+        if not shutil.which("runpodctl"):
+            return ["`runpodctl` not found; see references/backends.md (runpod)"]
+        b = self.balance()
+        if b is None:
+            return ["runpodctl can't read the account; configure the key: runpodctl config --apiKey <key>"]
+        log(f"runpod account ok, balance US${b:.2f}")
+        return [] if b >= 1 else [f"low RunPod balance (US${b:.2f})"]
+
+    def start(self):
+        problems = self.check()
+        if problems:
+            raise SystemExit("runpod not usable: " + "; ".join(problems))
+        name = f"talkframe-{time.strftime('%H%M%S')}"
+        for gpu in self.gpus:
+            log(f"runpod: creating a pod with {gpu}")
+            r = self.rp("pod", "create", "--name", name, "--image", self.IMAGE, "--gpu-id", gpu,
+                        "--cloud-type", self.cloud, "--container-disk-in-gb", str(self.disk), "--min-cuda-version", "12.8",
+                        "--ports", "22/tcp", "--wait", "--wait-timeout", "12m", check=False, timeout=900)
+            out = (r.stdout or "") + (r.stderr or "")
+            try:
+                d = json.loads(r.stdout)
+            except ValueError:
+                d = {}
+            pid = d.get("id") or (re.search(r'"id"\s*:\s*"(\w+)"', out) or [None, None])[1]
+            if r.returncode == 0 and d.get("ssh", {}).get("ip"):
+                self.pod, self.cost_hr = d["id"], d.get("costPerHr")
+                sshd = d["ssh"]
+                self.host, self.port = f"root@{sshd['ip']}", str(sshd["port"])
+                key = (sshd.get("ssh_key") or {}).get("path") or os.path.expanduser("~/.runpod/ssh/runpodctl-ssh-key")
+                self.opts = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ServerAliveInterval=30",
+                             "-o", "ConnectTimeout=15", "-i", key, "-o", "IdentitiesOnly=yes"]
+                self.t_start = time.time()
+                log(f"runpod: pod {self.pod} ({gpu}, US${self.cost_hr}/h, {d.get('machine', {}).get('dataCenterId')})")
+                break
+            if pid:  # created but never became reachable: don't leave it billing
+                self.rp("pod", "delete", pid, check=False)
+            if "no longer any instances" in out or "not available" in out.lower() or "timeout" in out.lower():
+                log(f"runpod: no {gpu} available right now")
+                continue
+            raise SystemExit(f"runpod pod create failed: {out.strip()[-600:]}")
+        else:
+            log(f"runpod: none of {', '.join(self.gpus)} available; try later")
+            sys.exit(EXIT_NO_GPU)
+        # --wait only proves port 22 answers; the container may still be booting, so wait for a real login
+        for i in range(60):
+            if self.ssh("nvidia-smi -L", check=False, timeout=60).returncode == 0:
+                break
+            time.sleep(10)
+        else:
+            raise SystemExit(f"runpod: pod {self.pod} never accepted ssh")
+        self.ssh(f"mkdir -p {self.qdir}/in {self.qdir}/out")
+
+    def stop(self):
+        if not self.pod:
+            return
+        if self.keep:
+            log(f"leaving pod {self.pod} running (--keep); delete it with: runpodctl pod delete {self.pod}")
+            return
+        self.rp("pod", "delete", self.pod, check=False)
+        log(f"runpod: pod {self.pod} deleted")
+
+    def cost_usd(self):
+        if self.cost_hr and self.t_start:
+            return round(self.cost_hr * (time.time() - self.t_start) / 3600, 3)
+        return None
 
 
 class Local:
@@ -329,7 +428,7 @@ class Local:
         pass
 
 
-BACKENDS = {"colab": Colab, "ssh": Ssh, "local": Local}
+BACKENDS = {"colab": Colab, "ssh": Ssh, "runpod": Runpod, "local": Local}
 
 
 # ---------------------------------------------------------------- stitching
@@ -373,6 +472,14 @@ def add_common(ap):
     ap.add_argument("--gpu-attempts", type=int, default=10, help="colab: retries when no GPU is free (1/min)")
     ap.add_argument("--host", help="ssh backend: user@host")
     ap.add_argument("--remote-dir", default="talkframe-work", help="ssh backend: working dir on the host")
+    ap.add_argument("--ssh-port", type=int, help="ssh backend: port (default 22)")
+    ap.add_argument("--ssh-key", help="ssh backend: private key file")
+    ap.add_argument("--runpod-gpu", default="NVIDIA L40S,NVIDIA RTX 6000 Ada Generation,NVIDIA L40,NVIDIA RTX A6000,"
+                    "NVIDIA A100 80GB PCIe,NVIDIA A100-SXM4-80GB",
+                    help="runpod: GPU ids to try in order (48 GB+ cards are enough at 480p)")
+    ap.add_argument("--runpod-cloud", choices=("SECURE", "COMMUNITY"), default="SECURE",
+                    help="runpod: SECURE guarantees a public ssh port")
+    ap.add_argument("--runpod-disk", type=int, default=120, help="runpod: container disk GB (models + ComfyUI ~60 GB)")
     ap.add_argument("--remote-python", default="python3", help="python with CUDA torch (ssh/local backends)")
 
 
@@ -406,7 +513,7 @@ def cmd_generate(args):
     # A queue that kills talkframe on a timeout sends SIGTERM: turn it into a normal exit so the `finally` below still
     # stops the Colab VM (otherwise it keeps billing until Colab reclaims it).
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
-    before = be.balance() if isinstance(be, Colab) else None
+    before = be.balance() if hasattr(be, "balance") else None
     out_dir = os.path.join(work, "out")
     shutil.rmtree(out_dir, ignore_errors=True)  # never stitch parts left over from an earlier run
     os.makedirs(out_dir)
@@ -434,13 +541,17 @@ def cmd_generate(args):
             os.remove(raw)
     rr = os.path.join(work, "out", "remote_report.json")
     remote = json.load(open(rr)) if os.path.isfile(rr) else {}
-    after = be.balance() if isinstance(be, Colab) else None
+    after = be.balance() if hasattr(be, "balance") else None
+    used = round(before - after, 2) if before is not None and after is not None else None
     report = {**p, "wall_seconds": round(time.time() - t0), "gpu": remote.get("gpu"),
               "render_seconds": sum(j["render_seconds"] for j in remote.get("jobs", [])) or None,
-              "colab_units_used": round(before - after, 2) if before is not None and after is not None else None}
+              "colab_units_used": used if isinstance(be, Colab) else None,
+              "runpod_usd_estimate": be.cost_usd() if isinstance(be, Runpod) else None}
     rep_path = os.path.splitext(p["output"])[0] + ".report.json"
     json.dump(report, open(rep_path, "w"), indent=1)
-    log(f"DONE {p['output']} ({report['wall_seconds']}s wall, units {report['colab_units_used']}) report: {rep_path}")
+    cost = (f"units {report['colab_units_used']}" if isinstance(be, Colab) else
+            f"~US${report['runpod_usd_estimate']}" if isinstance(be, Runpod) else "local")
+    log(f"DONE {p['output']} ({report['wall_seconds']}s wall, {cost}) report: {rep_path}")
     return 0
 
 
