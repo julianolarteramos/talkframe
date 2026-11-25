@@ -19,7 +19,7 @@ colab --auth adc usage                     # shows the compute-unit balance
 - **Account:** the Google account must be the one holding the Colab subscription.
 
 What talkframe does on each run:
-1. `colab new` with the first free GPU from `--gpu` (default `A100,H100`), retrying every minute (`--gpu-attempts`).
+1. `colab new` with the first free GPU from `--gpu` (default `A100,H100`), retrying every minute (`--gpu-attempts`). A GPU your plan isn't entitled to is dropped from the list right away; seen 2026-11-25: Colab Pro rejects H100 with "rejected accelerator … quota or entitlement".
 2. Uploads inputs and `job.py`.
 3. Runs it with `colab exec --timeout 0`.
 4. Downloads the parts and stops the VM, even on failure or when killed with SIGTERM (exit 143).

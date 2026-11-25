@@ -215,7 +215,8 @@ class Colab:
             return
         # --gpu may list fallbacks ("A100,H100,L4"): each attempt tries the next one, so a busy pool doesn't block the run
         gpus = [g.strip().upper() for g in self.gpu.split(",") if g.strip()]
-        for i in range(self.attempts):
+        i = 0
+        while i < self.attempts:
             gpu = gpus[i % len(gpus)]
             try:
                 r = self.c("new", "-s", self.s, "--gpu", gpu, check=False, timeout=300)
@@ -225,10 +226,18 @@ class Colab:
             if self.alive():
                 log(f"colab session {self.s} ({gpu})")
                 return
+            if "rejected accelerator" in err or "entitlement" in err:
+                # this plan can't use that GPU at all (e.g. H100 without Pro+): drop it and try the others right away
+                gpus.remove(gpu)
+                log(f"this Colab plan can't use {gpu}; continuing with {','.join(gpus) or 'nothing'}")
+                if not gpus:
+                    raise SystemExit(f"none of the GPUs in --gpu {self.gpu} are allowed on this Colab plan")
+                continue
             if not any(k in err for k in ("unavailable", "503", "timeout", "capacity", "try again")):
                 raise SystemExit(f"colab new failed (not a busy pool): {err.strip()[-800:]}")
-            if i + 1 < self.attempts:
-                log(f"no {gpu} available, attempt {i + 1}/{self.attempts}; retrying in 60s")
+            i += 1
+            if i < self.attempts:
+                log(f"no {gpu} available, attempt {i}/{self.attempts}; retrying in 60s")
                 time.sleep(60)
         self.c("stop", "-s", self.s, check=False)  # a timed-out `new` may still come up later; don't leave it billing
         log(f"could not get a Colab GPU ({self.gpu}) after {self.attempts} attempts; try later")
