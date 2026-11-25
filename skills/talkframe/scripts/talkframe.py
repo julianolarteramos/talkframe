@@ -464,6 +464,76 @@ def stitch(p, jobs, work):
          "-c:a", "aac", "-b:a", "192k", "-t", str(p["audio_seconds_exact"]), "-movflags", "+faststart", p["output"]])
 
 
+# ---------------------------------------------------------------- idle shutdown for --keep
+LEASES = os.path.expanduser("~/.cache/talkframe/leases")
+
+
+def lease_path(kind, name):
+    return os.path.join(LEASES, f"{kind}-{name}.json")
+
+
+def lease_update(kind, name, **fields):
+    os.makedirs(LEASES, exist_ok=True)
+    path = lease_path(kind, name)
+    try:
+        d = json.load(open(path))
+    except (OSError, ValueError):
+        d = {"kind": kind, "name": name}
+    d.update(fields)
+    tmp = path + ".tmp"
+    json.dump(d, open(tmp, "w"))
+    os.replace(tmp, path)
+    return path
+
+
+def lease_drop(kind, name):
+    try:
+        os.remove(lease_path(kind, name))
+    except OSError:
+        pass
+
+
+def ensure_reaper(path):
+    """Start a detached watcher that stops the VM/pod once its idle deadline passes (one watcher per lease)."""
+    try:
+        pid = json.load(open(path)).get("reaper_pid")
+        if pid:
+            os.kill(pid, 0)
+            return  # already watching
+    except (OSError, ValueError, TypeError):
+        pass
+    proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_reap", path], start_new_session=True,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    d = json.load(open(path))
+    d["reaper_pid"] = proc.pid
+    json.dump(d, open(path, "w"))
+
+
+def reap(path):
+    """Body of the detached watcher: wait while busy or before the deadline, then stop the session and remove the lease."""
+    while True:
+        try:
+            d = json.load(open(path))
+        except (OSError, ValueError):
+            return  # lease gone: the VM was stopped normally
+        if d.get("busy"):
+            time.sleep(30)
+            continue
+        left = d.get("deadline", 0) - time.time()
+        if left > 0:
+            time.sleep(min(left, 60))
+            continue
+        if d["kind"] == "colab":
+            subprocess.run(["colab", "--auth", "adc", "stop", "-s", d["name"]], capture_output=True)
+        elif d["kind"] == "runpod":
+            subprocess.run(["runpodctl", "pod", "delete", d["name"]], capture_output=True)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return
+
+
 def fingerprint(args):
     """Hash of everything that changes the rendered picture: same hash means the existing video is the same result."""
     import hashlib
@@ -553,11 +623,23 @@ def cmd_generate(args):
     out_dir = os.path.join(work, "out")
     shutil.rmtree(out_dir, ignore_errors=True)  # never stitch parts left over from an earlier run
     os.makedirs(out_dir)
+    lease = None
+    if isinstance(be, Colab) and be.reuse:
+        lease = lease_update("colab", be.s, busy=True)  # pause any idle-shutdown timer while this job uses the VM
     try:
         be.start()
         be.run_job(work, jobs)
     finally:
         be.stop()
+        name = be.s if isinstance(be, Colab) else getattr(be, "pod", None)
+        kind = "colab" if isinstance(be, Colab) else "runpod" if isinstance(be, Runpod) else None
+        if kind and name:
+            if getattr(be, "keep", False) and args.keep_max > 0:
+                lease = lease_update(kind, name, busy=False, deadline=time.time() + args.keep_max * 60)
+                ensure_reaper(lease)
+                log(f"{kind} {name} will be stopped automatically after {args.keep_max:g} idle minutes")
+            elif not getattr(be, "keep", False):
+                lease_drop(kind, name)
     stitch(p, jobs, work)
     if args.protect_region:
         # optional: paste the photo's exact pixels back over a flat detail (logo card, sign) that the model redraws
@@ -621,7 +703,9 @@ def main():
                         "photo's height (0.30 keeps the face in most portraits)")
     g.add_argument("--video-delay", type=int, default=0, help="frames to delay the picture vs the voice (lip-sync); 0 = none")
     g.add_argument("--no-noise-floor", action="store_true", help="send the audio to the model as-is (no noise floor in silences)")
-    g.add_argument("--keep", action="store_true", help="colab: leave the VM running after the job (reuse with --session)")
+    g.add_argument("--keep", action="store_true", help="colab/runpod: leave the VM running after the job (reuse with --session)")
+    g.add_argument("--keep-max", type=float, default=15,
+                   help="with --keep: stop the VM automatically after this many idle minutes (0 = never; default 15)")
     g.add_argument("--session", help="colab: run on this already-running session (e.g. one left by --keep); skips setup")
     g.add_argument("--dry-run", action="store_true", help="plan only: write plan.json/jobs.json, no GPU")
     args = ap.parse_args()
@@ -629,6 +713,11 @@ def main():
         if not shutil.which(tool):
             raise SystemExit(f"{tool} is required")
     sys.exit(cmd_check(args) if args.cmd == "check" else cmd_generate(args))
+
+
+if len(sys.argv) == 3 and sys.argv[1] == "_reap" and __name__ == "__main__":  # internal: detached idle watcher
+    reap(sys.argv[2])
+    sys.exit(0)
 
 
 if __name__ == "__main__":
