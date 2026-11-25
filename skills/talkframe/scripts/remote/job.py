@@ -189,8 +189,28 @@ def owns(comfy, port):
         os.remove(f"{comfy}/input/{name}")
 
 
-def start_comfy(comfy, workdir):
+def start_comfy(comfy, workdir, restart=False):
     global COMFY_PORT
+    pidfile = f"{workdir}/comfy.pid"
+    if restart and comfy_up(8188):
+        # a package the workflow needs (e.g. sageattention) is newer than our running server, which imported its nodes
+        # without it: stop that server (ours: by pid file, or by its exact command line) and start a fresh one
+        pids = []
+        try:
+            pids.append(int(open(pidfile).read()))
+        except (OSError, ValueError):
+            r = subprocess.run(["pgrep", "-f", "main.py --listen 127.0.0.1 --port 8188"], capture_output=True, text=True)
+            pids = [int(x) for x in r.stdout.split()]
+        for pid in pids:
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+        log("restarting ComfyUI so it picks up newly installed packages")
+        for _ in range(30):
+            if not comfy_up(8188):
+                break
+            time.sleep(1)
     for port in range(8188, 8198):
         if not comfy_up(port):
             COMFY_PORT = port
@@ -203,8 +223,9 @@ def start_comfy(comfy, workdir):
     else:
         raise SystemExit("no free port in 8188-8197 for ComfyUI")
     logf = open(f"{workdir}/comfy.log", "a")
-    subprocess.Popen([sys.executable, "main.py", "--listen", "127.0.0.1", "--port", str(COMFY_PORT), "--disable-auto-launch"],
-                     cwd=comfy, stdout=logf, stderr=subprocess.STDOUT)
+    proc = subprocess.Popen([sys.executable, "main.py", "--listen", "127.0.0.1", "--port", str(COMFY_PORT),
+                             "--disable-auto-launch"], cwd=comfy, stdout=logf, stderr=subprocess.STDOUT)
+    open(f"{workdir}/comfy.pid", "w").write(str(proc.pid))
     for i in range(200):
         if comfy_up():
             break
@@ -332,15 +353,22 @@ def main():
     dl.start()
     setup_comfy(comfy)
     extra = {j.get("attention") for j in json.load(open(f"{workdir}/in/jobs.json"))}
-    if "sageattn" in extra and not _has("sageattention"):
-        pip_install("sageattention==1.0.6")
+    restart = False
+    if "sageattn" in extra:
+        if not _has("sageattention"):
+            pip_install("sageattention==1.0.6")
+        import importlib.util
+        pkg = os.path.dirname(importlib.util.find_spec("sageattention").origin)
+        pidfile = f"{workdir}/comfy.pid"
+        started = os.path.getmtime(pidfile) if os.path.exists(pidfile) else 0
+        restart = os.path.getmtime(pkg) > started  # server older than the package (or unknown): restart it
     while dl.is_alive():
         log("still downloading models...")
         dl.join(25)
     if dl_err:
         raise SystemExit(f"model download failed: {dl_err[0]}")
     link_models(comfy, workdir)
-    start_comfy(comfy, workdir)
+    start_comfy(comfy, workdir, restart=restart)
     jobs = json.load(open(f"{workdir}/in/jobs.json"))
     report = []
     for job in jobs:
