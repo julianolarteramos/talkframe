@@ -23,11 +23,12 @@ except ImportError:
 
 
 def crop_like_render(img, w, h):
-    """Reproduce talkframe's framing (scale to cover, center crop) so photo and video pixels line up."""
+    """Reproduce talkframe's framing (scale to cover, then crop) so photo and video pixels line up."""
     ih, iw = img.shape[:2]
     s = max(w / iw, h / ih)
     r = cv2.resize(img, (round(iw * s), round(ih * s)), interpolation=cv2.INTER_AREA)
-    ox, oy = (r.shape[1] - w) // 2, (r.shape[0] - h) // 2
+    ox = (r.shape[1] - w) // 2
+    oy = (r.shape[0] - h) // 2
     return r[oy:oy + h, ox:ox + w], s, ox, oy
 
 

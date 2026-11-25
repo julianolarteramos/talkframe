@@ -21,7 +21,7 @@ The heavy lifting happens on a GPU machine. `scripts/talkframe.py` plans the job
 3. **Choose the size.**
    - Default `--resolution 480`: about 0.4 MP (848×480 for 16:9) and fastest. Good for overlays or anything shown smaller than ~1080 px wide.
    - `--resolution 720`: sharper, about 2–3× slower.
-   - `--size WxH` forces an exact frame. The image is center-cropped to that aspect.
+   - `--size WxH` forces an exact frame. If the photo's shape differs, talkframe crops it first. When the video is wider than the photo (a vertical portrait into a landscape strip), it keeps a band centred at 30 % of the photo's height, which usually holds the whole face (`--crop-y` adjusts it). When the video is taller, it keeps the horizontal centre. `PLAN … photo_crop=x,y,w,h` shows the box. If the face matters, look at the photo and adjust `--crop-y` so eyes and mouth are inside.
 
 4. **Check the backend once per session.**
    ```bash
@@ -29,7 +29,7 @@ The heavy lifting happens on a GPU machine. `scripts/talkframe.py` plans the job
    ```
    If it reports a problem, read `references/backends.md` for the one-time setup (Colab CLI + ADC login, an SSH host, or a local GPU) and walk the user through it. Login steps need the user in a browser, so ask them to run those commands.
 
-5. **Render.** This takes minutes, so run it in the background and watch the log instead of blocking:
+5. **Render.** Call the script directly, one command per call. It creates its own folders and prints what it did, so no `mkdir`, loops or pre-cropping are needed. Rendering takes minutes, so run it in the background and watch the log instead of blocking:
    ```bash
    python3 ${CLAUDE_SKILL_DIR}/scripts/talkframe.py generate \
      --image <photo> --audio <voice> --out <dir>/<name>.mp4 \

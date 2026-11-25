@@ -126,8 +126,26 @@ def plan(args):
         os.makedirs(os.path.join(work, "in"))
         log(f"cannot write {bad} ({e}); planning in {work} instead")
 
+    # Framing. If the photo's shape differs from the video's, crop the photo here, before the model sees it. When the
+    # video is wider, keep a horizontal band centred at --crop-y of the photo's height (0.30 suits most portraits:
+    # a plain centre crop of a vertical photo into a landscape strip lands on the chin or neck). When it is taller,
+    # keep the horizontal centre. The model then gets an image with the right shape and only scales it.
     ext = os.path.splitext(args.image)[1].lower() or ".png"
-    shutil.copy(args.image, os.path.join(work, "in", "image" + ext))
+    src_ar, dst_ar = iw / ih, w / h
+    if abs(src_ar / dst_ar - 1) > 0.02:
+        if dst_ar > src_ar:
+            cw, ch = iw, int(round(iw / dst_ar))
+            cx, cy = 0, int(min(max(args.crop_y * ih - ch / 2, 0), ih - ch))
+        else:
+            cw, ch = int(round(ih * dst_ar)), ih
+            cx, cy = (iw - cw) // 2, 0
+        crop = [cx, cy, cw, ch]
+        ext = ".png"
+        run(["ffmpeg", "-v", "error", "-y", "-i", args.image, "-vf", f"crop={cw}:{ch}:{cx}:{cy}", "-frames:v", "1",
+             os.path.join(work, "in", "image.png")])
+    else:
+        crop = [0, 0, iw, ih]
+        shutil.copy(args.image, os.path.join(work, "in", "image" + ext))
     bounds = [0.0, *cuts, dur]
     jobs = []
     for i in range(len(bounds) - 1):
@@ -149,7 +167,7 @@ def plan(args):
     json.dump(jobs, open(os.path.join(work, "in", "jobs.json"), "w"), indent=1)
     p = {"image": os.path.abspath(args.image), "image_size": [iw, ih], "audio": os.path.abspath(args.audio),
          "audio_seconds": round(dur, 2), "audio_seconds_exact": dur, "output": out, "output_size": [w, h], "segments": len(jobs),
-         "video_delay_frames": args.video_delay, "cut_points": cuts, "dry_run": bool(args.dry_run), "backend": args.backend, "workdir": work, "prompt": args.prompt or DEFAULT_PROMPT}
+         "video_delay_frames": args.video_delay, "photo_crop": crop, "cut_points": cuts, "dry_run": bool(args.dry_run), "backend": args.backend, "workdir": work, "prompt": args.prompt or DEFAULT_PROMPT}
     json.dump(p, open(os.path.join(work, "plan.json"), "w"), indent=1)
     return p, jobs, work
 
@@ -369,7 +387,7 @@ def cmd_generate(args):
     log(f"plan: {p['audio_seconds']}s audio -> {len(jobs)} segment(s), {p['output_size'][0]}x{p['output_size'][1]}, "
         f"backend {args.backend}, workdir {work}")
     if args.dry_run:
-        print(f"PLAN output_size={p['output_size'][0]}x{p['output_size'][1]} segments={p['segments']} "
+        print(f"PLAN output_size={p['output_size'][0]}x{p['output_size'][1]} segments={p['segments']} photo_crop={','.join(map(str, p['photo_crop']))} "
               f"audio_seconds={p['audio_seconds']} backend={p['backend']} workdir={work}", flush=True)
         log(f"dry run: wrote {os.path.join(work, 'plan.json')} and in/jobs.json; nothing was rendered")
         print(json.dumps(p, indent=1))
@@ -389,8 +407,13 @@ def cmd_generate(args):
         # optional: paste the photo's exact pixels back over a flat detail (logo card, sign) that the model redraws
         raw = os.path.splitext(p["output"])[0] + ".raw.mp4"
         os.replace(p["output"], raw)
-        r = subprocess.run([*args.protect_cmd, os.path.join(HERE, "protect.py"), "--video", raw, "--image", p["image"],
-                            "--region", args.protect_region, "--out", p["output"]])
+        # the region is given in the original photo; shift it into the cropped image the model actually saw
+        rx, ry, rw, rh = (float(v) for v in args.protect_region.split(","))
+        cx, cy = p["photo_crop"][:2]
+        region = f"{rx - cx},{ry - cy},{rw},{rh}"
+        model_img = [os.path.join(work, "in", f) for f in os.listdir(os.path.join(work, "in")) if f.startswith("image.")][0]
+        r = subprocess.run([*args.protect_cmd, os.path.join(HERE, "protect.py"), "--video", raw, "--image", model_img,
+                            "--region", region, "--out", p["output"]])
         if r.returncode:
             os.replace(raw, p["output"])
             log("protect-region failed; kept the unprotected video (see message above)")
@@ -428,6 +451,9 @@ def main():
     g.add_argument("--workdir", help="where inputs/parts are kept (default: <out>.talkframe/)")
     g.add_argument("--protect-region", help="X,Y,W,H in photo pixels of a flat logo/sign to keep pixel-exact (needs numpy+opencv)")
     g.add_argument("--protect-python", help="python with numpy+opencv for --protect-region (default: this one, else `uv run --with`)")
+    g.add_argument("--crop-y", type=float, default=0.30,
+                   help="when the video is wider than the photo: vertical centre of the kept band, as a fraction of the "
+                        "photo's height (0.30 keeps the face in most portraits)")
     g.add_argument("--video-delay", type=int, default=4, help="frames to delay the picture vs the voice (lip-sync); 0 = none")
     g.add_argument("--no-noise-floor", action="store_true", help="send the audio to the model as-is (no noise floor in silences)")
     g.add_argument("--keep", action="store_true", help="colab: leave the VM running after the job (reuse with --session)")
