@@ -3,7 +3,7 @@ name: transcribe-not-talkframe
 description: Near miss - audio + video vocabulary, but the user wants subtitles, not a talking video.
 tags: [trigger, negative]
 context:
-  add_dirs: [fixtures]
+  scaffold_script: scaffold.sh
 execution:
   prompt: |
     I recorded fixtures/voice-8s.mp3 for a talking-head video I already filmed. I only need an .srt subtitle file

@@ -3,7 +3,7 @@ name: reel-strip-plan
 description: Portrait photo + short voice clip, user wants a horizontal strip for the bottom of a vertical reel; plan only.
 tags: [trigger, planning]
 context:
-  add_dirs: [fixtures]
+  scaffold_script: scaffold.sh
 execution:
   prompt: |
     hey, fixtures/presenter.jpg is our AI news host and fixtures/voice-8s.mp3 is today's intro line (spanish).
@@ -28,11 +28,11 @@ graders:
     type: file_exists
     path: "out/**/plan.json"
   - name: landscape-under-1080
-    type: llm
+    type: regex
+    # width 704-1080 and height 288-639: a landscape frame no wider than 1080 px
+    pattern: '"output_size":\s*\[\s*(70[4-9]|7[1-9]\d|[89]\d\d|10[0-7]\d|1080),\s*(2[89]\d|[3-5]\d\d|6[0-3]\d)\s*\]'
     target: { source: file, path: "out/**/plan.json" }
-    criteria: |
-      PASS if output_size is landscape (first number, the width, is larger than the second) and the width is at most 1080.
-      FAIL if it is portrait/square, wider than 1080, or the file is missing.
+    weight: 2
   - name: honest-report
     type: llm
     criteria: |

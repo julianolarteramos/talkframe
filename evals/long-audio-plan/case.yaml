@@ -3,7 +3,7 @@ name: long-audio-plan
 description: Audio over 60 s must be planned as more than one segment split at a pause; plan only.
 tags: [planning]
 context:
-  add_dirs: [fixtures]
+  scaffold_script: scaffold.sh
 execution:
   prompt: |
     Can you make fixtures/presenter.jpg narrate fixtures/voice-long.mp3 as a talking-head video? Just do a dry run

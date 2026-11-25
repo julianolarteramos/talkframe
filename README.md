@@ -69,7 +69,7 @@ talkframe.py generate                          job.py
 `evals/` holds a suite for [`claude plugin eval`](https://code.claude.com/docs/en/plugin-evals.md). It checks that the skill triggers when it should and not when it shouldn't, and that it plans jobs correctly in `--dry-run` mode, so it spends no GPU time:
 
 ```bash
-claude plugin eval . --allow-tools "Bash(python3 *)" "Bash(ffprobe *)" "Bash(ffmpeg *)"
+claude plugin eval . --scaffold --allow-tools "Bash(python3:*)" "Bash(ffprobe:*)" "Bash(ffmpeg:*)"
 ```
 
 ## Models and licenses
