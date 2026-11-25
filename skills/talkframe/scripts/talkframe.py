@@ -133,7 +133,7 @@ def plan(args):
     json.dump(jobs, open(os.path.join(work, "in", "jobs.json"), "w"), indent=1)
     p = {"image": os.path.abspath(args.image), "image_size": [iw, ih], "audio": os.path.abspath(args.audio),
          "audio_seconds": round(dur, 2), "audio_seconds_exact": dur, "output": out, "output_size": [w, h], "segments": len(jobs),
-         "cut_points": cuts, "dry_run": bool(args.dry_run), "backend": args.backend, "workdir": work, "prompt": args.prompt or DEFAULT_PROMPT}
+         "video_delay_frames": args.video_delay, "cut_points": cuts, "dry_run": bool(args.dry_run), "backend": args.backend, "workdir": work, "prompt": args.prompt or DEFAULT_PROMPT}
     json.dump(p, open(os.path.join(work, "plan.json"), "w"), indent=1)
     return p, jobs, work
 
@@ -272,7 +272,10 @@ def stitch(p, jobs, work):
     for k, (x, j) in enumerate(zip(parts, jobs)):
         ins += ["-i", x]
         chains.append(f"[{k}:v]tpad=stop_mode=clone:stop_duration=2,trim=duration={j['seconds']},setpts=PTS-STARTPTS[v{k}]")
-    graph = ";".join(chains) + ";" + "".join(f"[v{k}]" for k in range(len(parts))) + f"concat=n={len(parts)}:v=1:a=0[v]"
+    graph = ";".join(chains) + ";" + "".join(f"[v{k}]" for k in range(len(parts))) + f"concat=n={len(parts)}:v=1:a=0[c]"
+    # InfiniteTalk's mouth leads the voice by ~0.1-0.2 s (it anticipates the next word). Holding the first frame for
+    # a few frames shifts the picture later; 4 frames (160 ms) looked best in side-by-side tests.
+    graph += f";[c]tpad=start_mode=clone:start_duration={p.get('video_delay_frames', 4) / 25}[v]"
     run(["ffmpeg", "-v", "error", "-y", *ins, "-i", p["audio"], "-filter_complex", graph,
          "-map", "[v]", "-map", f"{len(parts)}:a", "-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p",
          "-c:a", "aac", "-b:a", "192k", "-t", str(p["audio_seconds_exact"]), "-movflags", "+faststart", p["output"]])
@@ -360,6 +363,7 @@ def main():
     g.add_argument("--workdir", help="where inputs/parts are kept (default: <out>.talkframe/)")
     g.add_argument("--protect-region", help="X,Y,W,H in photo pixels of a flat logo/sign to keep pixel-exact (needs numpy+opencv)")
     g.add_argument("--protect-python", default=sys.executable, help="python that has numpy+opencv for --protect-region")
+    g.add_argument("--video-delay", type=int, default=4, help="frames to delay the picture vs the voice (lip-sync); 0 = none")
     g.add_argument("--no-noise-floor", action="store_true", help="send the audio to the model as-is (no noise floor in silences)")
     g.add_argument("--keep", action="store_true", help="colab: leave the VM running after the job")
     g.add_argument("--dry-run", action="store_true", help="plan only: write plan.json/jobs.json, no GPU")
