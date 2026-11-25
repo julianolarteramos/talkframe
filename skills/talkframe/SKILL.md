@@ -40,7 +40,7 @@ The heavy lifting happens on a GPU machine. `scripts/talkframe.py` plans the job
    - Add `--dry-run` to only plan. It spends no GPU time and prints a one-line `PLAN output_size=… segments=…` summary, then the full plan. The plan files (`plan.json`, `in/jobs.json`) go next to the output, or to a temp dir if that place is read-only; the printed `workdir` says where. Use it to show the user the plan, or when they only asked what would happen.
    - Audio longer than 60 s is split at pauses into ≤60 s segments, because InfiniteTalk's colors drift on very long takes. Each segment restarts from the photo, and the original audio is laid back over the joined picture, so the sound has no seams.
    - Each rendered part is padded to its exact audio length before joining, because the model returns a few frames short. That keeps later segments in sync and the last word intact.
-   - The picture is delayed 4 frames (160 ms) against the voice by default (`--video-delay`), because InfiniteTalk's mouth tends to lead the audio. Side-by-side tests at 0, 2 and 4 frames chose 4.
+   - Picture and voice are kept as rendered (`--video-delay 0`). Measured on real reels, the mouth starts ~1 frame before the voice, which is natural. A 4-frame delay was tried as the default and made the lips visibly late. Use `--video-delay N` only to nudge a specific clip.
    - Timing on a Colab A100:
      - A fresh VM spends ~5 min installing and downloading.
      - Rendering then takes ~20–25 s per second of video at 480p.

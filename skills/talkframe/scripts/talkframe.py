@@ -446,9 +446,10 @@ def stitch(p, jobs, work):
         chains.append(f"[{k}:v]fps={FPS},tpad=stop_mode=clone:stop_duration=2,trim=end_frame={j['frames']},"
                       f"setpts=PTS-STARTPTS[v{k}]")
     graph = ";".join(chains) + ";" + "".join(f"[v{k}]" for k in range(len(parts))) + f"concat=n={len(parts)}:v=1:a=0[c]"
-    # InfiniteTalk's mouth leads the voice by ~0.1-0.2 s (it anticipates the next word). Holding the first frame for
-    # a few frames shifts the picture later; 4 frames (160 ms) looked best in side-by-side tests.
-    graph += f";[c]tpad=start_mode=clone:start_duration={p.get('video_delay_frames', 4) / FPS}[v]"
+    # Optional lip-sync nudge: hold the first frame N frames to move the picture later. Default 0: on 2026-11-25 a
+    # 4-frame default made the lips visibly late in a real reel, and onset measurements at 0 put the mouth ~1 frame
+    # ahead of the voice, which is natural speech timing.
+    graph += f";[c]tpad=start_mode=clone:start_duration={p.get('video_delay_frames', 0) / FPS}[v]"
     run(["ffmpeg", "-v", "error", "-y", *ins, "-i", p["audio"], "-filter_complex", graph,
          "-map", "[v]", "-map", f"{len(parts)}:a", "-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p",
          "-c:a", "aac", "-b:a", "192k", "-t", str(p["audio_seconds_exact"]), "-movflags", "+faststart", p["output"]])
@@ -578,7 +579,7 @@ def main():
     g.add_argument("--crop-y", type=float, default=0.30,
                    help="when the video is wider than the photo: vertical centre of the kept band, as a fraction of the "
                         "photo's height (0.30 keeps the face in most portraits)")
-    g.add_argument("--video-delay", type=int, default=4, help="frames to delay the picture vs the voice (lip-sync); 0 = none")
+    g.add_argument("--video-delay", type=int, default=0, help="frames to delay the picture vs the voice (lip-sync); 0 = none")
     g.add_argument("--no-noise-floor", action="store_true", help="send the audio to the model as-is (no noise floor in silences)")
     g.add_argument("--keep", action="store_true", help="colab: leave the VM running after the job (reuse with --session)")
     g.add_argument("--session", help="colab: run on this already-running session (e.g. one left by --keep); skips setup")
