@@ -110,10 +110,13 @@ def main():
             cv2.polylines(d, [corners.astype(np.int32)], True, (0, 255, 0) if score >= a.min_score else (0, 0, 255), 1)
             cv2.putText(d, f"{score:.2f}", (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
             dbg.stdin.write(d.tobytes())
+    codes = []
     for p in (out, dbg):
         if p:
             p.stdin.close()
-            p.wait()
+            codes.append(p.wait())
+    if any(codes):
+        sys.exit(f"[protect] ffmpeg failed while writing the output (exit codes {codes})")
     print(f"[protect] region {rx},{ry},{rw}x{rh} in video; pasted on {pasted}/{n} frames ({100 * pasted / max(n, 1):.0f}%) -> {a.out}")
 
 

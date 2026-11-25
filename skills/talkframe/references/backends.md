@@ -25,7 +25,7 @@ What talkframe does on each run:
 4. Downloads the parts and stops the VM, even on failure.
 5. Compares the compute-unit balance before and after.
 
-`--keep` leaves the VM up so the next run skips setup. Stop it later with `colab --auth adc stop -s <name>`, because an idle VM still burns units.
+`--keep` leaves the VM up. Pass its name to the next run with `--session <name>` and that run skips the install and the model download. Stop it at the end (a final run without `--keep`, or `colab --auth adc stop -s <name>`), because an idle VM still burns units and Colab may reclaim it anyway.
 
 Colab specifics:
 - **Keep the kernel busy.** Work started in the background over `colab ssh` doesn't count as activity, so Colab reclaims the VM in ~20–30 min and the outputs are lost. That's why the job runs inside the kernel through `colab exec`.

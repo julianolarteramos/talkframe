@@ -35,8 +35,9 @@ The heavy lifting happens on a GPU machine. `scripts/talkframe.py` plans the job
      --image <photo> --audio <voice> --out <dir>/<name>.mp4 \
      --prompt "<scene prompt>" [--resolution 480|720] [--backend colab|ssh|local] [--host user@gpu-box]
    ```
-   - Exit code **75** means no Colab GPU was free after all retries. Nothing is broken, so try again later. Any other non-zero code is a real failure.
-   - Add `--dry-run` to only plan. It writes `plan.json` and `in/jobs.json` next to the output and spends no GPU time. Use it to show the user the plan, or when they only asked what would happen.
+   - Exit code **75** means no Colab GPU was free after all retries. Nothing is broken, so try again later. Auth, balance and other permanent problems fail fast with exit 1 instead.
+   - Several clips in a row: pass `--keep` on the first one, then `--session <name>` (printed at the end) on the next ones. That reuses the warm VM and skips the ~5 min of setup. The last call without `--keep` stops the VM.
+   - Add `--dry-run` to only plan. It spends no GPU time and prints a one-line `PLAN output_size=… segments=…` summary, then the full plan. The plan files (`plan.json`, `in/jobs.json`) go next to the output, or to a temp dir if that place is read-only; the printed `workdir` says where. Use it to show the user the plan, or when they only asked what would happen.
    - Audio longer than 60 s is split at pauses into ≤60 s segments, because InfiniteTalk's colors drift on very long takes. Each segment restarts from the photo, and the original audio is laid back over the joined picture, so the sound has no seams.
    - Each rendered part is padded to its exact audio length before joining, because the model returns a few frames short. That keeps later segments in sync and the last word intact.
    - The picture is delayed 4 frames (160 ms) against the voice by default (`--video-delay`), because InfiniteTalk's mouth tends to lead the audio. Side-by-side tests at 0, 2 and 4 frames chose 4.
@@ -72,7 +73,7 @@ The model redraws every pixel, so small text such as a microphone flag's logo dr
 
 1. Find the box in the photo's own pixel coordinates. Look at the image, or threshold the bright card with OpenCV.
 2. Include the whole card or sign, not just the letters. The edges are what make tracking stable.
-3. The step needs `numpy` and `opencv-python-headless` locally. Point `--protect-python` at a Python that has them.
+3. The step needs `numpy` and `opencv-python-headless`. If the Python running talkframe lacks them, it falls back to `uv run --with ...` on its own. Pass `--protect-python` only to force a specific interpreter.
 4. Check the result: crop the region from a few frames, side by side.
 
 ## When things fail

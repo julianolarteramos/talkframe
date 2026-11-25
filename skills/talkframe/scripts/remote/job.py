@@ -12,6 +12,8 @@ Only the Python standard library is needed to start; everything else is installe
 """
 import argparse
 import json
+import secrets
+import shlex
 import os
 import shutil
 import subprocess
@@ -62,23 +64,30 @@ def sh(cmd, cwd=None):
 def pip_install(args):
     py = sys.executable
     if shutil.which("uv"):
-        sh(f"uv pip install --python {py} -q {args}")
+        sh(f"uv pip install --python {shlex.quote(py)} -q {args}")
     else:
-        sh(f"{py} -m pip install -q {args}")
+        sh(f"{shlex.quote(py)} -m pip install -q {args}")
 
 
 def setup_comfy(comfy):
-    if os.path.exists(f"{comfy}/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt"):
+    marker = f"{comfy}/.talkframe-setup-ok"
+    if os.path.exists(marker):
         log("ComfyUI already installed")
         return
-    sh(f"git clone -q --depth 1 https://github.com/comfyanonymous/ComfyUI {comfy}")
+    if os.path.exists(comfy):
+        log("found an unfinished ComfyUI install; starting it over")
+        shutil.rmtree(comfy)
+    q = shlex.quote
+    sh(f"git clone -q --depth 1 https://github.com/comfyanonymous/ComfyUI {q(comfy)}")
     for repo in NODE_REPOS:
-        sh(f"git clone -q --depth 1 https://github.com/{repo} {comfy}/custom_nodes/{repo.split('/')[1]}")
+        sh(f"git clone -q --depth 1 https://github.com/{repo} {q(comfy + '/custom_nodes/' + repo.split('/')[1])}")
     # never let ComfyUI's requirements replace the machine's CUDA build of torch
-    sh(f"grep -v -E '^(torch|torchvision|torchaudio)([<>=~].*)?$' {comfy}/requirements.txt > {comfy}/requirements.notorch.txt")
-    reqs = " ".join(f"-r {comfy}/custom_nodes/{r.split('/')[1]}/requirements.txt" for r in NODE_REPOS)
-    pip_install(f"-r {comfy}/requirements.notorch.txt {reqs}")
-    pip_install(" ".join(f"'{p}'" for p in PINS))
+    sh(f"grep -v -E '^(torch|torchvision|torchaudio)([<>=~].*)?$' {q(comfy + '/requirements.txt')} "
+       f"> {q(comfy + '/requirements.notorch.txt')}")
+    reqs = " ".join(f"-r {q(comfy + '/custom_nodes/' + r.split('/')[1] + '/requirements.txt')}" for r in NODE_REPOS)
+    pip_install(f"-r {q(comfy + '/requirements.notorch.txt')} {reqs}")
+    pip_install(" ".join(q(p) for p in PINS))
+    open(marker, "w").write(time.strftime("%Y-%m-%d %H:%M:%S\n"))  # only now is the install complete
 
 
 def download_models(comfy):
@@ -108,18 +117,43 @@ def _has(mod):
         return False
 
 
-def comfy_up():
+def comfy_up(port=None):
     try:
-        urllib.request.urlopen(f"http://127.0.0.1:{COMFY_PORT}/system_stats", timeout=3)
+        urllib.request.urlopen(f"http://127.0.0.1:{port or COMFY_PORT}/system_stats", timeout=3)
         return True
     except Exception:
         return False
 
 
+def owns(comfy, port):
+    """True if the server on `port` serves this install's input folder (another workdir's server must not be used)."""
+    tok = secrets.token_hex(8)
+    name = f".talkframe-owner-{tok}.txt"
+    os.makedirs(f"{comfy}/input", exist_ok=True)
+    with open(f"{comfy}/input/{name}", "w") as f:
+        f.write(tok)
+    try:
+        got = urllib.request.urlopen(f"http://127.0.0.1:{port}/view?filename={name}&type=input", timeout=5).read().decode()
+        return got.strip() == tok
+    except Exception:
+        return False
+    finally:
+        os.remove(f"{comfy}/input/{name}")
+
+
 def start_comfy(comfy, workdir):
-    if comfy_up():
-        log("ComfyUI already running")
-        return
+    global COMFY_PORT
+    for port in range(8188, 8198):
+        if not comfy_up(port):
+            COMFY_PORT = port
+            break
+        if owns(comfy, port):
+            COMFY_PORT = port
+            log(f"ComfyUI already running on :{port}")
+            return
+        log(f"port {port} is another ComfyUI (different install); trying the next port")
+    else:
+        raise SystemExit("no free port in 8188-8197 for ComfyUI")
     logf = open(f"{workdir}/comfy.log", "a")
     subprocess.Popen([sys.executable, "main.py", "--listen", "127.0.0.1", "--port", str(COMFY_PORT), "--disable-auto-launch"],
                      cwd=comfy, stdout=logf, stderr=subprocess.STDOUT)

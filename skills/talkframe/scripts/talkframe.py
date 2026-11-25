@@ -32,6 +32,7 @@ DEFAULT_PROMPT = (
     "gesturing naturally with their hands while explaining. Their hair moves slightly. Realistic, steady medium shot."
 )
 COLAB_REMOTE = "/content/talkframe"
+FPS = 25
 EXIT_NO_GPU = 75  # EX_TEMPFAIL: no GPU was free; safe to retry later (queues can treat it as "busy", not "broken")
 
 
@@ -107,19 +108,23 @@ def plan(args):
         w, h = w // 16 * 16, h // 16 * 16
     else:
         w, h = target_size(iw, ih, args.resolution)
+    if args.max_segment < 5:
+        raise SystemExit("--max-segment must be at least 5 seconds")
     dur = audio_duration(args.audio)
     cuts = cut_points(args.audio, dur, args.max_segment)
     out = os.path.abspath(args.out)
     work = os.path.abspath(args.workdir or (os.path.splitext(out)[0] + ".talkframe"))
     try:
         os.makedirs(os.path.join(work, "in"), exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=os.path.join(work, "in")):
+            pass  # an existing dir can still be read-only
     except OSError as e:
         if not args.dry_run:
             raise SystemExit(f"cannot write the work dir {work}: {e}")
         # a dry run only needs scratch space; read-only sandboxes still get a plan
-        work = tempfile.mkdtemp(prefix="talkframe-plan-")
+        bad, work = work, tempfile.mkdtemp(prefix="talkframe-plan-")
         os.makedirs(os.path.join(work, "in"))
-        log(f"{e.strerror}: {os.path.dirname(out)}; planning in {work} instead")
+        log(f"cannot write {bad} ({e}); planning in {work} instead")
 
     ext = os.path.splitext(args.image)[1].lower() or ".png"
     shutil.copy(args.image, os.path.join(work, "in", "image" + ext))
@@ -138,7 +143,9 @@ def plan(args):
              *([] if noise else ["-map", "[v]"]), "-ar", "24000", wav])
         jobs.append({"name": name, "image": "image" + ext, "audio": f"{name}.wav", "prompt": args.prompt or DEFAULT_PROMPT,
                      "width": w, "height": h, "steps": args.steps, "seed": args.seed, "audio_scale": args.audio_scale,
-                     "seconds": round(bounds[i + 1] - bounds[i], 3)})
+                     "seconds": round(bounds[i + 1] - bounds[i], 3),
+                     # whole frames this part must fill, from absolute frame positions so rounding never accumulates
+                     "frames": round(bounds[i + 1] * FPS) - round(bounds[i] * FPS)})
     json.dump(jobs, open(os.path.join(work, "in", "jobs.json"), "w"), indent=1)
     p = {"image": os.path.abspath(args.image), "image_size": [iw, ih], "audio": os.path.abspath(args.audio),
          "audio_seconds": round(dur, 2), "audio_seconds_exact": dur, "output": out, "output_size": [w, h], "segments": len(jobs),
@@ -151,7 +158,8 @@ def plan(args):
 class Colab:
     def __init__(self, args):
         self.gpu, self.keep, self.attempts = args.gpu, getattr(args, "keep", False), args.gpu_attempts
-        self.s = f"talkframe-{time.strftime('%H%M%S')}"
+        self.reuse = getattr(args, "session", None)
+        self.s = self.reuse or f"talkframe-{time.strftime('%H%M%S')}"
 
     def c(self, *a, **kw):
         return run(["colab", "--auth", "adc", *a], **kw)
@@ -173,27 +181,45 @@ class Colab:
         log(f"colab account ok, balance {b} compute units")
         return [] if (b or 0) >= 2 else [f"low Colab balance ({b} units); an A100 burns ~8/h"]
 
+    def alive(self):
+        return f"[{self.s}]" in self.c("sessions", check=False).stdout
+
     def start(self):
+        # auth, CLI or balance problems are permanent: fail now instead of reporting them as "no GPU" (exit 75)
+        problems = self.check()
+        if problems:
+            raise SystemExit("colab not usable: " + "; ".join(problems))
+        if self.reuse:
+            if not self.alive():
+                raise SystemExit(f"--session {self.reuse}: no such running Colab session")
+            log(f"reusing colab session {self.s}")
+            return
         # --gpu may list fallbacks ("A100,H100,L4"): each attempt tries the next one, so a busy pool doesn't block the run
         gpus = [g.strip().upper() for g in self.gpu.split(",") if g.strip()]
         for i in range(self.attempts):
             gpu = gpus[i % len(gpus)]
             try:
-                self.c("new", "-s", self.s, "--gpu", gpu, check=False, timeout=300)
+                r = self.c("new", "-s", self.s, "--gpu", gpu, check=False, timeout=300)
+                err = (r.stdout + r.stderr).lower()
             except subprocess.TimeoutExpired:
-                pass
-            if f"[{self.s}]" in self.c("sessions", check=False).stdout:
+                err = "timeout"
+            if self.alive():
                 log(f"colab session {self.s} ({gpu})")
                 return
+            if not any(k in err for k in ("unavailable", "503", "timeout", "capacity", "try again")):
+                raise SystemExit(f"colab new failed (not a busy pool): {err.strip()[-800:]}")
             if i + 1 < self.attempts:
                 log(f"no {gpu} available, attempt {i + 1}/{self.attempts}; retrying in 60s")
                 time.sleep(60)
+        self.c("stop", "-s", self.s, check=False)  # a timed-out `new` may still come up later; don't leave it billing
         log(f"could not get a Colab GPU ({self.gpu}) after {self.attempts} attempts; try later")
         sys.exit(EXIT_NO_GPU)
 
     def run_job(self, work, jobs):
         p = subprocess.run(["colab", "--auth", "adc", "exec", "-s", self.s],
-                           input=f"import os; os.makedirs('{COLAB_REMOTE}/in', exist_ok=True)", text=True, capture_output=True)
+                           input=(f"import os, glob\nfor d in ('in', 'out'):\n    os.makedirs('{COLAB_REMOTE}/' + d, exist_ok=True)\n"
+                                  f"    [os.remove(f) for f in glob.glob('{COLAB_REMOTE}/' + d + '/*') if os.path.isfile(f)]\n"),
+                           text=True, capture_output=True)
         if p.returncode:
             raise SystemExit(f"colab exec failed: {p.stderr[-1500:]}")
         files = [os.path.join(work, "in", f) for f in os.listdir(os.path.join(work, "in"))]
@@ -201,8 +227,9 @@ class Colab:
             self.c("upload", "-s", self.s, f, f"{COLAB_REMOTE}/in/{os.path.basename(f)}", timeout=900)
         self.c("upload", "-s", self.s, REMOTE_JOB, f"{COLAB_REMOTE}/job.py", timeout=300)
         # exec keeps the kernel busy, so Colab does not reclaim the VM as idle; --timeout 0 allows long silent phases
-        subprocess.run(["colab", "--auth", "adc", "exec", "-s", self.s, "--timeout", "0", "-f", REMOTE_JOB])
-        os.makedirs(os.path.join(work, "out"), exist_ok=True)
+        rc = subprocess.run(["colab", "--auth", "adc", "exec", "-s", self.s, "--timeout", "0", "-f", REMOTE_JOB]).returncode
+        if rc:
+            raise SystemExit(f"remote job failed (colab exec exit {rc}); see the log above")
         for name in [j["name"] for j in jobs] + ["remote_report"]:
             ext = ".json" if name == "remote_report" else ".mp4"
             self.c("download", "-s", self.s, f"{COLAB_REMOTE}/out/{name}{ext}", os.path.join(work, "out", name + ext),
@@ -210,7 +237,8 @@ class Colab:
 
     def stop(self):
         if self.keep:
-            log(f"leaving session {self.s} running (--keep); stop it with: colab stop -s {self.s}")
+            log(f"leaving session {self.s} running (--keep): reuse it with --session {self.s}, "
+                f"stop it with: colab --auth adc stop -s {self.s}")
         else:
             self.c("stop", "-s", self.s, check=False)
 
@@ -220,6 +248,9 @@ class Ssh:
         if not args.host:
             raise SystemExit("--host user@machine is required for the ssh backend")
         self.host, self.py, self.rdir = args.host, args.remote_python, args.remote_dir
+        if any(c.isspace() for c in self.rdir):
+            raise SystemExit("--remote-dir must not contain spaces")
+        self.qdir = shlex.quote(self.rdir) if not self.rdir.startswith("~/") else '"$HOME"/' + shlex.quote(self.rdir[2:])
 
     def ssh(self, cmd, **kw):
         return run(["ssh", "-o", "BatchMode=yes", self.host, cmd], **kw)
@@ -233,15 +264,17 @@ class Ssh:
         return []
 
     def start(self):
-        self.ssh(f"mkdir -p {self.rdir}/in {self.rdir}/out")
+        # out/ is emptied so a failed job can never hand back parts from an earlier run
+        self.ssh(f"mkdir -p {self.qdir}/in {self.qdir}/out && rm -f {self.qdir}/out/* {self.qdir}/in/*")
 
     def run_job(self, work, jobs):
         files = [os.path.join(work, "in", f) for f in os.listdir(os.path.join(work, "in"))]
         run(["scp", "-q", *files, f"{self.host}:{self.rdir}/in/"])
         run(["scp", "-q", REMOTE_JOB, f"{self.host}:{self.rdir}/job.py"])
-        subprocess.run(["ssh", "-o", "BatchMode=yes", self.host,
-                        f"cd {self.rdir} && {self.py} job.py --workdir {shlex.quote(self.rdir)}"])
-        os.makedirs(os.path.join(work, "out"), exist_ok=True)
+        rc = subprocess.run(["ssh", "-o", "BatchMode=yes", self.host,
+                             f"cd {self.qdir} && {self.py} job.py --workdir ."]).returncode
+        if rc:
+            raise SystemExit(f"remote job failed on {self.host} (exit {rc}); see the log above")
         run(["scp", "-q", f"{self.host}:{self.rdir}/out/*", os.path.join(work, "out") + "/"], check=False)
 
     def stop(self):
@@ -260,7 +293,9 @@ class Local:
         pass
 
     def run_job(self, work, jobs):
-        subprocess.run([self.py, REMOTE_JOB, "--workdir", work])
+        rc = subprocess.run([self.py, REMOTE_JOB, "--workdir", work]).returncode
+        if rc:
+            raise SystemExit(f"local job failed (exit {rc}); see the log above")
 
     def stop(self):
         pass
@@ -281,11 +316,12 @@ def stitch(p, jobs, work):
     ins, chains = [], []
     for k, (x, j) in enumerate(zip(parts, jobs)):
         ins += ["-i", x]
-        chains.append(f"[{k}:v]tpad=stop_mode=clone:stop_duration=2,trim=duration={j['seconds']},setpts=PTS-STARTPTS[v{k}]")
+        chains.append(f"[{k}:v]fps={FPS},tpad=stop_mode=clone:stop_duration=2,trim=end_frame={j['frames']},"
+                      f"setpts=PTS-STARTPTS[v{k}]")
     graph = ";".join(chains) + ";" + "".join(f"[v{k}]" for k in range(len(parts))) + f"concat=n={len(parts)}:v=1:a=0[c]"
     # InfiniteTalk's mouth leads the voice by ~0.1-0.2 s (it anticipates the next word). Holding the first frame for
     # a few frames shifts the picture later; 4 frames (160 ms) looked best in side-by-side tests.
-    graph += f";[c]tpad=start_mode=clone:start_duration={p.get('video_delay_frames', 4) / 25}[v]"
+    graph += f";[c]tpad=start_mode=clone:start_duration={p.get('video_delay_frames', 4) / FPS}[v]"
     run(["ffmpeg", "-v", "error", "-y", *ins, "-i", p["audio"], "-filter_complex", graph,
          "-map", "[v]", "-map", f"{len(parts)}:a", "-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p",
          "-c:a", "aac", "-b:a", "192k", "-t", str(p["audio_seconds_exact"]), "-movflags", "+faststart", p["output"]])
@@ -326,19 +362,25 @@ def cmd_check(args):
 
 def cmd_generate(args):
     t0 = time.time()
+    if args.protect_region and not args.dry_run:
+        # resolve it before spending GPU time, so a missing OpenCV can't strand a finished render
+        args.protect_cmd = [args.protect_python] if args.protect_python else protect_python()
     p, jobs, work = plan(args)
     log(f"plan: {p['audio_seconds']}s audio -> {len(jobs)} segment(s), {p['output_size'][0]}x{p['output_size'][1]}, "
         f"backend {args.backend}, workdir {work}")
     if args.dry_run:
+        print(f"PLAN output_size={p['output_size'][0]}x{p['output_size'][1]} segments={p['segments']} "
+              f"audio_seconds={p['audio_seconds']} backend={p['backend']} workdir={work}", flush=True)
         log(f"dry run: wrote {os.path.join(work, 'plan.json')} and in/jobs.json; nothing was rendered")
         print(json.dumps(p, indent=1))
-        print(f"PLAN output_size={p['output_size'][0]}x{p['output_size'][1]} segments={p['segments']} "
-              f"audio_seconds={p['audio_seconds']} backend={p['backend']}")
         return 0
     be = BACKENDS[args.backend](args)
     before = be.balance() if isinstance(be, Colab) else None
-    be.start()
+    out_dir = os.path.join(work, "out")
+    shutil.rmtree(out_dir, ignore_errors=True)  # never stitch parts left over from an earlier run
+    os.makedirs(out_dir)
     try:
+        be.start()
         be.run_job(work, jobs)
     finally:
         be.stop()
@@ -347,8 +389,7 @@ def cmd_generate(args):
         # optional: paste the photo's exact pixels back over a flat detail (logo card, sign) that the model redraws
         raw = os.path.splitext(p["output"])[0] + ".raw.mp4"
         os.replace(p["output"], raw)
-        py = [args.protect_python] if args.protect_python else protect_python()
-        r = subprocess.run([*py, os.path.join(HERE, "protect.py"), "--video", raw, "--image", p["image"],
+        r = subprocess.run([*args.protect_cmd, os.path.join(HERE, "protect.py"), "--video", raw, "--image", p["image"],
                             "--region", args.protect_region, "--out", p["output"]])
         if r.returncode:
             os.replace(raw, p["output"])
@@ -389,7 +430,8 @@ def main():
     g.add_argument("--protect-python", help="python with numpy+opencv for --protect-region (default: this one, else `uv run --with`)")
     g.add_argument("--video-delay", type=int, default=4, help="frames to delay the picture vs the voice (lip-sync); 0 = none")
     g.add_argument("--no-noise-floor", action="store_true", help="send the audio to the model as-is (no noise floor in silences)")
-    g.add_argument("--keep", action="store_true", help="colab: leave the VM running after the job")
+    g.add_argument("--keep", action="store_true", help="colab: leave the VM running after the job (reuse with --session)")
+    g.add_argument("--session", help="colab: run on this already-running session (e.g. one left by --keep); skips setup")
     g.add_argument("--dry-run", action="store_true", help="plan only: write plan.json/jobs.json, no GPU")
     args = ap.parse_args()
     for tool in ("ffmpeg", "ffprobe"):
