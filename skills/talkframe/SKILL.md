@@ -18,7 +18,10 @@ The heavy lifting happens on a GPU machine. `scripts/talkframe.py` plans the job
 
 2. **Look at the image and write the scene prompt** in English: who they are, where they are, what they hold, and how they should move while talking. A specific prompt is what makes the motion feel natural, so follow `references/prompting.md`. Don't describe lip shapes; the audio drives the mouth.
 
-3. **Choose the size.**
+3. **Choose the size and quality.**
+   - `--quality fast` is the default: 4 steps + SageAttention + fp8 matmuls on GPUs that have fp8 hardware. In side-by-side tests it was ~35 % quicker with no visible loss.
+   - `--quality high` (6 steps, plain attention) is for hero clips, or when the user asks for the best possible take.
+   - `--steps`, `--attention` and `--fp8-fast` override single parts.
    - Default `--resolution 480`: about 0.4 MP (848×480 for 16:9) and fastest. Good for overlays or anything shown smaller than ~1080 px wide.
    - `--resolution 720`: sharper, about 2–3× slower.
    - `--size WxH` forces an exact frame. If the photo's shape differs, talkframe crops it first. When the video is wider than the photo (a vertical portrait into a landscape strip), it keeps a band centred at 30 % of the photo's height, which usually holds the whole face (`--crop-y` adjusts it). When the video is taller, it keeps the horizontal centre. `PLAN … photo_crop=x,y,w,h` shows the box. If the face matters, look at the photo and adjust `--crop-y` so eyes and mouth are inside.
@@ -64,7 +67,7 @@ The heavy lifting happens on a GPU machine. `scripts/talkframe.py` plans the job
 | Too little body motion | A more specific prompt about gestures and the setting; a wider image with hands visible |
 | Face changes identity over a long clip | `--max-segment 30` |
 | A different take of the same clip | `--seed <n>` |
-| Softness | `--resolution 720`, or `--steps 8` |
+| Softness or less detail than wanted | `--quality high` (6 steps, plain attention; ~35 % slower), then `--steps 8` or `--resolution 720` |
 | Logo or text in the photo wobbles (mic flag, sign, printed name) | `--protect-region X,Y,W,H` (photo pixels; see below) |
 | Mouth hangs open during short pauses | Partly handled: silences get a quiet noise floor before the model (measured ~20–30% less opening). The rest is the model anticipating the next word; avoid pure-zero gaps when editing the voice track. `--no-noise-floor` turns the floor off. |
 

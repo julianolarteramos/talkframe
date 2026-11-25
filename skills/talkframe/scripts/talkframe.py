@@ -164,7 +164,7 @@ def plan(args):
                      "width": w, "height": h, "steps": args.steps, "seed": args.seed, "audio_scale": args.audio_scale,
                      "seconds": round(bounds[i + 1] - bounds[i], 3),
                      "attention": args.attention,
-                     "quantization": "fp8_e4m3fn_scaled_fast" if args.fp8_fast else "fp8_e4m3fn_scaled",
+                     "fp8_fast": args.fp8_fast,
                      # whole frames this part must fill, from absolute frame positions so rounding never accumulates
                      "frames": round(bounds[i + 1] * FPS) - round(bounds[i] * FPS)})
     json.dump(jobs, open(os.path.join(work, "in", "jobs.json"), "w"), indent=1)
@@ -543,7 +543,7 @@ def fingerprint(args):
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
     for k in ("prompt", "resolution", "size", "steps", "seed", "audio_scale", "max_segment", "crop_y", "video_delay",
-              "no_noise_floor", "protect_region", "attention", "fp8_fast"):
+              "no_noise_floor", "protect_region", "attention", "fp8_fast", "quality"):
         h.update(f"{k}={getattr(args, k, None)}|".encode())
     return h.hexdigest()[:16]
 
@@ -610,7 +610,7 @@ def cmd_generate(args):
     log(f"plan: {p['audio_seconds']}s audio -> {len(jobs)} segment(s), {p['output_size'][0]}x{p['output_size'][1]}, "
         f"backend {args.backend}, workdir {work}")
     if args.dry_run:
-        print(f"PLAN output_size={p['output_size'][0]}x{p['output_size'][1]} segments={p['segments']} photo_crop={','.join(map(str, p['photo_crop']))} "
+        print(f"PLAN output_size={p['output_size'][0]}x{p['output_size'][1]} segments={p['segments']} steps={args.steps} attention={args.attention} fp8_fast={args.fp8_fast} photo_crop={','.join(map(str, p['photo_crop']))} "
               f"audio_seconds={p['audio_seconds']} backend={p['backend']} workdir={work}", flush=True)
         log(f"dry run: wrote {os.path.join(work, 'plan.json')} and in/jobs.json; nothing was rendered")
         print(json.dumps(p, indent=1))
@@ -685,11 +685,13 @@ def main():
     g.add_argument("--prompt", help="English scene description; see references/prompting.md")
     g.add_argument("--resolution", type=int, choices=(480, 720), default=480)
     g.add_argument("--size", help="exact WxH instead of --resolution (rounded down to multiples of 16)")
-    g.add_argument("--steps", type=int, default=6, help="sampling steps (the lightx2v LoRA is distilled for 4-8)")
-    g.add_argument("--attention", choices=("sdpa", "sageattn"), default="sdpa",
-                   help="attention kernel; sageattn installs SageAttention on the GPU machine")
-    g.add_argument("--fp8-fast", action="store_true",
-                   help="fp8 matmuls on GPUs that have them (L40S, RTX 6000 Ada, H100); no gain on A100")
+    g.add_argument("--quality", choices=("fast", "high"), default="fast",
+                   help="fast (default): 4 steps + SageAttention + fp8 matmuls where the GPU has them, ~35%% quicker; "
+                        "high: 6 steps, plain attention and fp8 storage only. --steps/--attention/--fp8-fast override it")
+    g.add_argument("--steps", type=int, help="sampling steps (the lightx2v LoRA is distilled for 4-8)")
+    g.add_argument("--attention", choices=("sdpa", "sageattn"), help="attention kernel (sageattn is installed on demand)")
+    g.add_argument("--fp8-fast", choices=("auto", "on", "off"),
+                   help="fp8 matmuls: auto uses them only on GPUs with fp8 hardware (Ada/Hopper/Blackwell, not A100)")
     g.add_argument("--force", action="store_true",
                    help="render again even if --out already holds a video made from the same inputs")
     g.add_argument("--seed", type=int, default=2)
@@ -709,6 +711,11 @@ def main():
     g.add_argument("--session", help="colab: run on this already-running session (e.g. one left by --keep); skips setup")
     g.add_argument("--dry-run", action="store_true", help="plan only: write plan.json/jobs.json, no GPU")
     args = ap.parse_args()
+    if args.cmd == "generate":
+        preset = {"fast": (4, "sageattn", "auto"), "high": (6, "sdpa", "off")}[args.quality]
+        args.steps = args.steps if args.steps is not None else preset[0]
+        args.attention = args.attention or preset[1]
+        args.fp8_fast = args.fp8_fast or preset[2]
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
             raise SystemExit(f"{tool} is required")

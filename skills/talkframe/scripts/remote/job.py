@@ -242,6 +242,15 @@ def start_comfy(comfy, workdir, restart=False):
     log("ComfyUI up")
 
 
+def quantization(job):
+    """fp8 matmuls need fp8 tensor cores (compute capability 8.9+: Ada, Hopper, Blackwell). A100 (8.0) keeps fp8 storage only."""
+    mode = job.get("fp8_fast", "off")
+    if mode == "auto":
+        import torch
+        mode = "on" if torch.cuda.get_device_capability(0) >= (8, 9) else "off"
+    return "fp8_e4m3fn_scaled_fast" if mode == "on" else "fp8_e4m3fn_scaled"
+
+
 def build_graph(job, image_name, audio_name):
     w, h = job["width"], job["height"]
     return {
@@ -251,7 +260,7 @@ def build_graph(job, image_name, audio_name):
             "model": "WanVideo/InfiniteTalk/Wan2_1-InfiniteTalk-Single_fp8_e4m3fn_scaled_KJ.safetensors"}},
         "model": {"class_type": "WanVideoModelLoader", "inputs": {
             "model": "WanVideo/Wan2_1-I2V-14B-480p_fp8_e4m3fn_scaled_KJ.safetensors", "base_precision": "bf16",
-            "quantization": job.get("quantization", "fp8_e4m3fn_scaled"), "load_device": "main_device",
+            "quantization": quantization(job), "load_device": "main_device",
             "attention_mode": job.get("attention", "sdpa"),
             "lora": ["lora", 0], "multitalk_model": ["mt", 0]}},
         "vae": {"class_type": "WanVideoVAELoader", "inputs": {"model_name": "Wan2_1_VAE_bf16.safetensors", "precision": "bf16"}},
