@@ -6,6 +6,7 @@ These are real failures hit while building talkframe (November 2026), with the f
 |---|---|---|
 | `could not get a Colab A100` / `Service Unavailable` on `colab new` | No free A100 in the pool | Wait and retry (`--gpu-attempts 30`), or use `--gpu H100` or `--gpu L4` |
 | `colab auth failed` / HTTP 401 | ADC missing the Colab scopes, or a different Google account | Re-run the `gcloud auth application-default login --scopes=...` line in `backends.md` |
+| `colab auth failed` the day after it worked (`No valid default credentials`) | Google Workspace accounts can force re-authentication every N hours (admin "session control"), which kills the ADC refresh token | Re-run the ADC login. For unattended use, ask the Workspace admin to exempt the account or use a personal Google account for Colab |
 | Keyring "is locked" prompts | CLI's oauth2 mode on a headless box or WSL | Use ADC; the script already passes `--auth adc` |
 | `Timeout waiting for output: no message from the kernel for 30s` | `colab exec` without `--timeout 0` | Already handled by the script; add it if you call `colab exec` yourself |
 | VM disappears mid-render; `session not found` | Colab reclaimed an idle kernel (work was started outside the kernel) | Run the job through `colab exec`, as the script does |

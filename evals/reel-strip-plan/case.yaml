@@ -8,8 +8,8 @@ execution:
   prompt: |
     hey, fixtures/presenter.jpg is our AI news host and fixtures/voice-8s.mp3 is today's intro line (spanish).
     I want her saying that line as a talking video that sits in a horizontal band at the bottom of a 1080x1920 reel,
-    so landscape and not wider than 1080px. Don't render anything yet, I just want to see the plan it would run
-    (put whatever it writes under out/). Tell me the frame size and how long it would take.
+    so landscape and not wider than 1080px. Don't render anything yet, I just want to see the plan it would run.
+    Tell me the frame size and how long it would take.
   max_turns: 25
   timeout_seconds: 600
   allowed_tools: [Read, Glob, Grep, Skill]
@@ -24,14 +24,11 @@ graders:
     tool: Bash
     input_match: "talkframe.py generate.*--dry-run|--dry-run.*talkframe.py generate"
     weight: 2
-  - name: plan-written
-    type: file_exists
-    path: "out/**/plan.json"
   - name: landscape-under-1080
     type: regex
-    # width 704-1080 and height 288-639: a landscape frame no wider than 1080 px
-    pattern: '"output_size":\s*\[\s*(70[4-9]|7[1-9]\d|[89]\d\d|10[0-7]\d|1080),\s*(2[89]\d|[3-5]\d\d|6[0-3]\d)\s*\]'
-    target: { source: file, path: "out/**/plan.json" }
+    # the dry run prints a PLAN line; width 704-1080 and height 288-639 = a landscape frame no wider than 1080 px
+    pattern: 'PLAN output_size=(70[4-9]|7[1-9]\d|[89]\d\d|10[0-7]\d|1080)x(2[89]\d|[3-5]\d\d|6[0-3]\d) '
+    target: trace
     weight: 2
   - name: honest-report
     type: llm

@@ -32,6 +32,7 @@ DEFAULT_PROMPT = (
     "gesturing naturally with their hands while explaining. Their hair moves slightly. Realistic, steady medium shot."
 )
 COLAB_REMOTE = "/content/talkframe"
+EXIT_NO_GPU = 75  # EX_TEMPFAIL: no GPU was free; safe to retry later (queues can treat it as "busy", not "broken")
 
 
 # ---------------------------------------------------------------- helpers
@@ -110,7 +111,15 @@ def plan(args):
     cuts = cut_points(args.audio, dur, args.max_segment)
     out = os.path.abspath(args.out)
     work = os.path.abspath(args.workdir or (os.path.splitext(out)[0] + ".talkframe"))
-    os.makedirs(os.path.join(work, "in"), exist_ok=True)
+    try:
+        os.makedirs(os.path.join(work, "in"), exist_ok=True)
+    except OSError as e:
+        if not args.dry_run:
+            raise SystemExit(f"cannot write the work dir {work}: {e}")
+        # a dry run only needs scratch space; read-only sandboxes still get a plan
+        work = tempfile.mkdtemp(prefix="talkframe-plan-")
+        os.makedirs(os.path.join(work, "in"))
+        log(f"{e.strerror}: {os.path.dirname(out)}; planning in {work} instead")
 
     ext = os.path.splitext(args.image)[1].lower() or ".png"
     shutil.copy(args.image, os.path.join(work, "in", "image" + ext))
@@ -141,7 +150,7 @@ def plan(args):
 # ---------------------------------------------------------------- backends
 class Colab:
     def __init__(self, args):
-        self.gpu, self.keep, self.attempts = args.gpu, args.keep, args.gpu_attempts
+        self.gpu, self.keep, self.attempts = args.gpu, getattr(args, "keep", False), args.gpu_attempts
         self.s = f"talkframe-{time.strftime('%H%M%S')}"
 
     def c(self, *a, **kw):
@@ -179,7 +188,8 @@ class Colab:
             if i + 1 < self.attempts:
                 log(f"no {gpu} available, attempt {i + 1}/{self.attempts}; retrying in 60s")
                 time.sleep(60)
-        raise SystemExit(f"could not get a Colab GPU ({self.gpu}) after {self.attempts} attempts; try later")
+        log(f"could not get a Colab GPU ({self.gpu}) after {self.attempts} attempts; try later")
+        sys.exit(EXIT_NO_GPU)
 
     def run_job(self, work, jobs):
         p = subprocess.run(["colab", "--auth", "adc", "exec", "-s", self.s],
@@ -281,6 +291,17 @@ def stitch(p, jobs, work):
          "-c:a", "aac", "-b:a", "192k", "-t", str(p["audio_seconds_exact"]), "-movflags", "+faststart", p["output"]])
 
 
+def protect_python():
+    """A Python that has numpy + OpenCV: this one if it does, else a throwaway env from `uv` (cached after first use)."""
+    ok = subprocess.run([sys.executable, "-c", "import cv2, numpy"], capture_output=True).returncode == 0
+    if ok:
+        return [sys.executable]
+    if shutil.which("uv"):
+        return ["uv", "run", "--no-project", "-q", "--with", "numpy", "--with", "opencv-python-headless", "python"]
+    raise SystemExit("--protect-region needs numpy+opencv: pip install numpy opencv-python-headless, install uv, "
+                     "or pass --protect-python")
+
+
 # ---------------------------------------------------------------- commands
 def add_common(ap):
     ap.add_argument("--backend", choices=BACKENDS, default="colab")
@@ -311,6 +332,8 @@ def cmd_generate(args):
     if args.dry_run:
         log(f"dry run: wrote {os.path.join(work, 'plan.json')} and in/jobs.json; nothing was rendered")
         print(json.dumps(p, indent=1))
+        print(f"PLAN output_size={p['output_size'][0]}x{p['output_size'][1]} segments={p['segments']} "
+              f"audio_seconds={p['audio_seconds']} backend={p['backend']}")
         return 0
     be = BACKENDS[args.backend](args)
     before = be.balance() if isinstance(be, Colab) else None
@@ -324,7 +347,8 @@ def cmd_generate(args):
         # optional: paste the photo's exact pixels back over a flat detail (logo card, sign) that the model redraws
         raw = os.path.splitext(p["output"])[0] + ".raw.mp4"
         os.replace(p["output"], raw)
-        r = subprocess.run([args.protect_python, os.path.join(HERE, "protect.py"), "--video", raw, "--image", p["image"],
+        py = [args.protect_python] if args.protect_python else protect_python()
+        r = subprocess.run([*py, os.path.join(HERE, "protect.py"), "--video", raw, "--image", p["image"],
                             "--region", args.protect_region, "--out", p["output"]])
         if r.returncode:
             os.replace(raw, p["output"])
@@ -362,7 +386,7 @@ def main():
     g.add_argument("--max-segment", type=float, default=60.0, help="split audio longer than this (seconds) at pauses")
     g.add_argument("--workdir", help="where inputs/parts are kept (default: <out>.talkframe/)")
     g.add_argument("--protect-region", help="X,Y,W,H in photo pixels of a flat logo/sign to keep pixel-exact (needs numpy+opencv)")
-    g.add_argument("--protect-python", default=sys.executable, help="python that has numpy+opencv for --protect-region")
+    g.add_argument("--protect-python", help="python with numpy+opencv for --protect-region (default: this one, else `uv run --with`)")
     g.add_argument("--video-delay", type=int, default=4, help="frames to delay the picture vs the voice (lip-sync); 0 = none")
     g.add_argument("--no-noise-floor", action="store_true", help="send the audio to the model as-is (no noise floor in silences)")
     g.add_argument("--keep", action="store_true", help="colab: leave the VM running after the job")

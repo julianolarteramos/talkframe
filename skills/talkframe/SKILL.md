@@ -35,6 +35,7 @@ The heavy lifting happens on a GPU machine. `scripts/talkframe.py` plans the job
      --image <photo> --audio <voice> --out <dir>/<name>.mp4 \
      --prompt "<scene prompt>" [--resolution 480|720] [--backend colab|ssh|local] [--host user@gpu-box]
    ```
+   - Exit code **75** means no Colab GPU was free after all retries. Nothing is broken, so try again later. Any other non-zero code is a real failure.
    - Add `--dry-run` to only plan. It writes `plan.json` and `in/jobs.json` next to the output and spends no GPU time. Use it to show the user the plan, or when they only asked what would happen.
    - Audio longer than 60 s is split at pauses into ≤60 s segments, because InfiniteTalk's colors drift on very long takes. Each segment restarts from the photo, and the original audio is laid back over the joined picture, so the sound has no seams.
    - Each rendered part is padded to its exact audio length before joining, because the model returns a few frames short. That keeps later segments in sync and the last word intact.
