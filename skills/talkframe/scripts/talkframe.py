@@ -455,8 +455,9 @@ def stitch(p, jobs, work):
     ins, chains = [], []
     for k, (x, j) in enumerate(zip(parts, jobs)):
         ins += ["-i", x]
-        chains.append(f"[{k}:v]fps={FPS},tpad=stop_mode=clone:stop_duration=2,trim=end_frame={j['frames']},"
-                      f"setpts=PTS-STARTPTS[v{k}]")
+        # scale to the planned frame too: a model may render its own bucket size (LongCat: 832x480 for 16:9)
+        chains.append(f"[{k}:v]fps={FPS},scale={j['width']}:{j['height']}:flags=lanczos,setsar=1,"
+                      f"tpad=stop_mode=clone:stop_duration=2,trim=end_frame={j['frames']},setpts=PTS-STARTPTS[v{k}]")
     graph = ";".join(chains) + ";" + "".join(f"[v{k}]" for k in range(len(parts))) + f"concat=n={len(parts)}:v=1:a=0[c]"
     # Optional lip-sync nudge: hold the first frame N frames to move the picture later. Default 0: on 2026-11-25 a
     # 4-frame default made the lips visibly late in a real reel, and onset measurements at 0 put the mouth ~1 frame
@@ -545,9 +546,13 @@ def fingerprint(args):
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
-    for k in ("prompt", "resolution", "size", "steps", "seed", "audio_scale", "max_segment", "crop_y", "video_delay",
-              "no_noise_floor", "protect_region", "attention", "fp8_fast", "quality", "model", "lc_mix_alpha",
-              "lc_mix_steps"):
+    keys = ["prompt", "resolution", "size", "steps", "seed", "audio_scale", "max_segment", "crop_y", "video_delay",
+            "no_noise_floor", "protect_region", "attention", "fp8_fast", "quality", "model", "lc_mix_alpha",
+            "lc_mix_steps"]
+    if getattr(args, "model", "infinitetalk") == "longcat":
+        # only what changes a LongCat render (seed, steps, attention and fp8 do not reach its script)
+        keys = [k for k in keys if k not in ("seed", "steps", "attention", "fp8_fast", "quality", "audio_scale")]
+    for k in keys:
         h.update(f"{k}={getattr(args, k, None)}|".encode())
     return h.hexdigest()[:16]
 
@@ -731,8 +736,14 @@ def main():
                            if model == "longcat" else
                            "NVIDIA L40S,NVIDIA RTX 6000 Ada Generation,NVIDIA L40,NVIDIA RTX A6000,"
                            "NVIDIA A100 80GB PCIe,NVIDIA A100-SXM4-80GB")
-    if model == "longcat" and args.backend == "colab" and "H100" not in (args.gpu or ""):
-        raise SystemExit("longcat needs an 80 GB GPU; Colab's A100 is 40 GB: use --backend runpod (default) or ssh")
+    if model == "longcat" and args.backend == "colab":
+        big = [g for g in (args.gpu or "").split(",") if g.strip().upper() == "H100"]
+        if not big:
+            raise SystemExit("longcat needs an 80 GB GPU; Colab's A100 is 40 GB: use --backend runpod (default), "
+                             "ssh, or --gpu H100 if your Colab plan has it")
+        args.gpu = "H100"  # never fall back to the 40 GB A100
+    if args.cmd == "generate" and model == "longcat" and args.seed != 2:
+        raise SystemExit("--seed has no effect with --model longcat (its script fixes the seed); drop it")
     if args.cmd == "generate":
         preset = {"fast": (4, "sageattn", "auto"), "high": (6, "sdpa", "off")}[args.quality]
         args.steps = args.steps if args.steps is not None else preset[0]
