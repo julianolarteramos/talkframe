@@ -48,8 +48,11 @@ def main():
     ref, s, ox, oy = crop_like_render(cv2.imread(a.image), W, H)
     x, y, w, h = (float(v) for v in a.region.split(","))
     rx, ry, rw, rh = round(x * s - ox), round(y * s - oy), round(w * s), round(h * s)
-    if rx < 0 or ry < 0 or rx + rw > W or ry + rh > H or rw < 16 or rh < 8:
+    # objects near the edge (a cube at the bottom of the frame) can poke a pixel or two out after scaling: clip them
+    x0, y0, x1, y1 = max(rx, 0), max(ry, 0), min(rx + rw, W), min(ry + rh, H)
+    if x1 - x0 < 16 or y1 - y0 < 8:
         sys.exit(f"region maps to {rx},{ry},{rw},{rh} in the {W}x{H} video: outside the frame or too small")
+    rx, ry, rw, rh = x0, y0, x1 - x0, y1 - y0
     patch = ref[ry:ry + rh, rx:rx + rw].copy()
     tmpl = cv2.GaussianBlur(cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY), (3, 3), 0).astype(np.float32)
 
