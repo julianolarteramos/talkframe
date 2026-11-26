@@ -456,7 +456,9 @@ def stitch(p, jobs, work):
     for k, (x, j) in enumerate(zip(parts, jobs)):
         ins += ["-i", x]
         # scale to the planned frame too: a model may render its own bucket size (LongCat: 832x480 for 16:9)
-        chains.append(f"[{k}:v]fps={FPS},scale={j['width']}:{j['height']}:flags=lanczos,setsar=1,"
+        # cover-then-crop keeps proportions when a model's own bucket differs in shape from the planned frame
+        chains.append(f"[{k}:v]fps={FPS},scale={j['width']}:{j['height']}:force_original_aspect_ratio=increase:"
+                      f"flags=lanczos,crop={j['width']}:{j['height']},setsar=1,"
                       f"tpad=stop_mode=clone:stop_duration=2,trim=end_frame={j['frames']},setpts=PTS-STARTPTS[v{k}]")
     graph = ";".join(chains) + ";" + "".join(f"[v{k}]" for k in range(len(parts))) + f"concat=n={len(parts)}:v=1:a=0[c]"
     # Optional lip-sync nudge: hold the first frame N frames to move the picture later. Default 0: on 2026-11-25 a
@@ -547,11 +549,11 @@ def fingerprint(args):
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
     keys = ["prompt", "resolution", "size", "steps", "seed", "audio_scale", "max_segment", "crop_y", "video_delay",
-            "no_noise_floor", "protect_region", "attention", "fp8_fast", "quality", "model", "lc_mix_alpha",
-            "lc_mix_steps"]
+            "no_noise_floor", "protect_region", "attention", "fp8_fast", "quality"]  # InfiniteTalk: unchanged set
     if getattr(args, "model", "infinitetalk") == "longcat":
         # only what changes a LongCat render (seed, steps, attention and fp8 do not reach its script)
         keys = [k for k in keys if k not in ("seed", "steps", "attention", "fp8_fast", "quality", "audio_scale")]
+        keys += ["model", "lc_mix_alpha", "lc_mix_steps"]
     for k in keys:
         h.update(f"{k}={getattr(args, k, None)}|".encode())
     return h.hexdigest()[:16]
@@ -570,6 +572,9 @@ def protect_python():
 
 # ---------------------------------------------------------------- commands
 def add_common(ap):
+    ap.add_argument("--model", choices=("infinitetalk", "longcat"), default="infinitetalk",
+                    help="infinitetalk (default; Wan 2.1 + InfiniteTalk via ComfyUI, fits a 40 GB A100) or longcat "
+                         "(LongCat-Video-Avatar 1.6: steadiest hands and identity in tests; needs an 80 GB GPU)")
     ap.add_argument("--backend", choices=BACKENDS,
                     help="default: colab for infinitetalk, runpod for longcat (Colab's 40 GB A100 is too small for it)")
     ap.add_argument("--gpu", default="A100,H100", help="colab GPU or comma list of fallbacks: A100, H100, L4 (default A100,H100)")
@@ -695,9 +700,6 @@ def main():
     g.add_argument("--prompt", help="English scene description; see references/prompting.md")
     g.add_argument("--resolution", type=int, choices=(480, 720), default=480)
     g.add_argument("--size", help="exact WxH instead of --resolution (rounded down to multiples of 16)")
-    g.add_argument("--model", choices=("infinitetalk", "longcat"), default="infinitetalk",
-                   help="infinitetalk (default; Wan 2.1 + InfiniteTalk via ComfyUI, fits a 40 GB A100) or longcat "
-                        "(LongCat-Video-Avatar 1.6: steadiest hands and identity in tests; needs an 80 GB GPU)")
     g.add_argument("--lc-mix-alpha", type=float, default=0.5,
                    help="longcat: DMD share in the distill LoRA mix (1.0 exaggerated the mouth; official default 0.5)")
     g.add_argument("--lc-mix-steps", type=int, default=3, help="longcat: steps that use the LoRA mix (official default 3)")
@@ -742,8 +744,13 @@ def main():
             raise SystemExit("longcat needs an 80 GB GPU; Colab's A100 is 40 GB: use --backend runpod (default), "
                              "ssh, or --gpu H100 if your Colab plan has it")
         args.gpu = "H100"  # never fall back to the 40 GB A100
-    if args.cmd == "generate" and model == "longcat" and args.seed != 2:
-        raise SystemExit("--seed has no effect with --model longcat (its script fixes the seed); drop it")
+    if args.cmd == "generate" and model == "longcat":
+        ignored = [f for f, v in (("--seed", args.seed != 2), ("--steps", args.steps is not None),
+                                  ("--attention", args.attention is not None), ("--fp8-fast", args.fp8_fast is not None),
+                                  ("--audio-scale", args.audio_scale != 1.0), ("--quality", args.quality != "high")) if v]
+        if ignored:
+            raise SystemExit(f"{', '.join(ignored)} has no effect with --model longcat; drop it "
+                             "(LongCat's knobs are --lc-mix-alpha and --lc-mix-steps)")
     if args.cmd == "generate":
         preset = {"fast": (4, "sageattn", "auto"), "high": (6, "sdpa", "off")}[args.quality]
         args.steps = args.steps if args.steps is not None else preset[0]

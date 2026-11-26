@@ -360,7 +360,10 @@ def main():
         # longcat.py ships next to job.py: in the work dir (Colab/ssh) or in scripts/remote (local backend).
         # Under `colab exec` this code runs inside the kernel, where __file__ is not defined.
         here = os.path.dirname(os.path.abspath(globals().get("__file__", f"{workdir}/job.py")))
-        sys.path[:0] = [here, workdir]
+        for d in (workdir, here):
+            if d not in sys.path:
+                sys.path.insert(0, d)
+        sys.modules.pop("longcat", None)  # a reused Colab kernel may hold an older copy of the module
         import longcat
         report = longcat.run(workdir, jobs)
         json.dump({"gpu": torch.cuda.get_device_name(0), "model": "longcat", "jobs": report},

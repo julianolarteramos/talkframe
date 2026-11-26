@@ -19,7 +19,7 @@ import threading
 import time
 
 REPO = "https://github.com/meituan-longcat/LongCat-Video"
-COMMIT = "58eb336edc"
+COMMIT = "58eb336edc5c8c63389838727e40b8c18434e54e"  # full sha: fetched directly, survives upstream history growth
 WEIGHTS = [
     ("meituan-longcat/LongCat-Video", "LongCat-Video",
      ["tokenizer/*", "text_encoder/*", "vae/*", "scheduler/*", "config.json", "model_index.json"]),
@@ -41,11 +41,19 @@ def log(msg):
 
 
 def sh(cmd, env=None, cwd=None):
+    log(f"$ {cmd[:110]}")
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env, cwd=cwd)
     if r.returncode:
         print(r.stdout[-2000:], r.stderr[-4000:], flush=True)
         raise SystemExit(f"longcat setup failed: {cmd[:120]}")
     return r.stdout
+
+
+def _safe(fn, workdir, errs):
+    try:
+        return fn(workdir)
+    except BaseException as e:  # SystemExit from sh() included: reported by run()
+        errs.append(repr(e))
 
 
 def download(workdir, errs):
@@ -64,10 +72,14 @@ def download(workdir, errs):
 def setup(workdir):
     import torch
     venv, repo = f"{workdir}/lcenv", f"{workdir}/LongCat-Video"
+    import hashlib
+    recipe = hashlib.sha256((COMMIT + "|".join(PIP) + repr(sorted(FLASH.items()))).encode()).hexdigest()[:16]
     marker = f"{venv}/.talkframe-longcat-ok"
-    if os.path.exists(marker):
+    if os.path.exists(marker) and open(marker).read().split()[0:1] == [recipe]:
         log("environment already installed")
         return venv, repo
+    if os.path.exists(marker):
+        log("recipe changed since the last install; reinstalling")
     for d in (venv, repo):
         shutil.rmtree(d, ignore_errors=True)
     if not shutil.which("ffmpeg"):
@@ -89,9 +101,9 @@ def setup(workdir):
     sh(f"{py} -m pip install -q ninja packaging psutil")
     sh(f"{py} -m pip install -q -c {cons} '{wheel}'")
     sh(f"{py} -m pip install -q -c {cons} " + " ".join(f"'{p}'" for p in PIP))
-    sh(f"git clone -q --depth 50 --single-branch --branch main {REPO} {repo} && cd {repo} && git checkout -q {COMMIT}")
+    sh(f"git init -q {repo} && cd {repo} && git fetch -q --depth 1 {REPO} {COMMIT} && git checkout -q FETCH_HEAD")
     sh(f"{py} -c 'import flash_attn, transformers, diffusers, audio_separator.separator, librosa'")
-    open(marker, "w").write(time.strftime("%Y-%m-%d %H:%M:%S\n"))
+    open(marker, "w").write(f"{recipe} {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
     log("environment installed")
     return venv, repo
 
@@ -141,13 +153,20 @@ def render(job, workdir, venv, repo):
 
 
 def run(workdir, jobs):
-    errs = []
+    import torch
+    vram = torch.cuda.get_device_properties(0).total_memory / 2**30
+    if vram < 75:  # check before ~60 GB of downloads and a 10-minute install on a GPU that can't run it
+        raise SystemExit(f"longcat needs an 80 GB GPU; this one has {vram:.0f} GB ({torch.cuda.get_device_name(0)})")
+    errs, out = [], {}
     dl = threading.Thread(target=download, args=(workdir, errs), daemon=True)
+    st = threading.Thread(target=lambda: out.update(env=_safe(setup, workdir, errs)), daemon=True)
     dl.start()
-    venv, repo = setup(workdir)
-    while dl.is_alive():
-        log("still downloading weights...")
-        dl.join(25)
-    if errs:
-        raise SystemExit(f"longcat weight download failed: {errs[0]}")
+    st.start()
+    while dl.is_alive() or st.is_alive():  # heartbeat: colab exec must never see a silent kernel for long
+        log("installing / downloading...")
+        dl.join(12)
+        st.join(12)
+    if errs or not out.get("env"):
+        raise SystemExit(f"longcat setup failed: {errs[0] if errs else 'unknown error'}")
+    venv, repo = out["env"]
     return [{"name": j["name"], "render_seconds": round(render(j, workdir, venv, repo), 1)} for j in jobs]
