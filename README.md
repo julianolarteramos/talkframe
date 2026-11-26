@@ -4,7 +4,9 @@
 
 It is a [Claude Code](https://code.claude.com) plugin with one skill. Ask Claude something like *"make this photo of our presenter say narration.mp3, as a horizontal strip for the bottom of a reel"*. Claude writes the scene prompt from the photo, rents a GPU, renders, stitches and checks the result. Nobody has to babysit a notebook.
 
-Under the hood:
+Two models are supported. **InfiniteTalk** is the default; **LongCat-Video-Avatar 1.6** (`--model longcat`) has steadier hands and identity but needs an 80 GB GPU. Comparisons and metrics for both are in the repo history.
+
+Under the hood (InfiniteTalk):
 - **[InfiniteTalk](https://github.com/MeiGen-AI/InfiniteTalk)** for audio-driven motion, on top of **Wan 2.1 I2V 14B**.
 - Run through **ComfyUI** with **[kijai/ComfyUI-WanVideoWrapper](https://github.com/kijai/ComfyUI-WanVideoWrapper)**.
 - fp8 weights and the lightx2v step-distill LoRA (6 sampling steps).

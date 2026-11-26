@@ -27,6 +27,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REMOTE_JOB = os.path.join(HERE, "remote", "job.py")
+REMOTE_FILES = [REMOTE_JOB, os.path.join(HERE, "remote", "longcat.py")]  # everything the GPU machine needs
 PIXELS = {480: 832 * 480, 720: 1280 * 720}
 DEFAULT_PROMPT = (
     "A person speaks directly to the camera with natural, expressive facial expressions, subtle head movements and blinking, "
@@ -164,7 +165,8 @@ def plan(args):
                      "width": w, "height": h, "steps": args.steps, "seed": args.seed, "audio_scale": args.audio_scale,
                      "seconds": round(bounds[i + 1] - bounds[i], 3),
                      "attention": args.attention,
-                     "fp8_fast": args.fp8_fast,
+                     "fp8_fast": args.fp8_fast, "model": args.model, "resolution": args.resolution,
+                     "lc_mix_alpha": args.lc_mix_alpha, "lc_mix_steps": args.lc_mix_steps,
                      # whole frames this part must fill, from absolute frame positions so rounding never accumulates
                      "frames": round(bounds[i + 1] * FPS) - round(bounds[i] * FPS)})
     json.dump(jobs, open(os.path.join(work, "in", "jobs.json"), "w"), indent=1)
@@ -251,7 +253,8 @@ class Colab:
         bundle = os.path.join(work, "bundle.tgz")
         with tarfile.open(bundle, "w:gz") as tf:
             tf.add(os.path.join(work, "in"), arcname="in")
-            tf.add(REMOTE_JOB, arcname="job.py")
+            for f in REMOTE_FILES:
+                tf.add(f, arcname=os.path.basename(f))
         p = subprocess.run(["colab", "--auth", "adc", "exec", "-s", self.s],
                            input=(f"import os, glob\nfor d in ('in', 'out'):\n    os.makedirs('{COLAB_REMOTE}/' + d, exist_ok=True)\n"
                                   f"    [os.remove(f) for f in glob.glob('{COLAB_REMOTE}/' + d + '/*') if os.path.isfile(f)]\n"),
@@ -314,7 +317,7 @@ class Ssh:
     def run_job(self, work, jobs):
         files = [os.path.join(work, "in", f) for f in os.listdir(os.path.join(work, "in"))]
         self.scp(*files, f"{self.host}:{self.rdir}/in/")
-        self.scp(REMOTE_JOB, f"{self.host}:{self.rdir}/job.py")
+        self.scp(*REMOTE_FILES, f"{self.host}:{self.rdir}/")
         rc = subprocess.run(["ssh", *self.opts, "-p", self.port, self.host,
                              f"cd {self.qdir} && {self.py} job.py --workdir ."]).returncode
         if rc:
@@ -543,7 +546,8 @@ def fingerprint(args):
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
     for k in ("prompt", "resolution", "size", "steps", "seed", "audio_scale", "max_segment", "crop_y", "video_delay",
-              "no_noise_floor", "protect_region", "attention", "fp8_fast", "quality"):
+              "no_noise_floor", "protect_region", "attention", "fp8_fast", "quality", "model", "lc_mix_alpha",
+              "lc_mix_steps"):
         h.update(f"{k}={getattr(args, k, None)}|".encode())
     return h.hexdigest()[:16]
 
@@ -561,16 +565,17 @@ def protect_python():
 
 # ---------------------------------------------------------------- commands
 def add_common(ap):
-    ap.add_argument("--backend", choices=BACKENDS, default="colab")
+    ap.add_argument("--backend", choices=BACKENDS,
+                    help="default: colab for infinitetalk, runpod for longcat (Colab's 40 GB A100 is too small for it)")
     ap.add_argument("--gpu", default="A100,H100", help="colab GPU or comma list of fallbacks: A100, H100, L4 (default A100,H100)")
     ap.add_argument("--gpu-attempts", type=int, default=10, help="colab: retries when no GPU is free (1/min)")
     ap.add_argument("--host", help="ssh backend: user@host")
     ap.add_argument("--remote-dir", default="talkframe-work", help="ssh backend: working dir on the host")
     ap.add_argument("--ssh-port", type=int, help="ssh backend: port (default 22)")
     ap.add_argument("--ssh-key", help="ssh backend: private key file")
-    ap.add_argument("--runpod-gpu", default="NVIDIA L40S,NVIDIA RTX 6000 Ada Generation,NVIDIA L40,NVIDIA RTX A6000,"
-                    "NVIDIA A100 80GB PCIe,NVIDIA A100-SXM4-80GB",
-                    help="runpod: GPU ids to try in order (48 GB+ cards are enough at 480p)")
+    ap.add_argument("--runpod-gpu",
+                    help="runpod: GPU ids to try in order. Default for infinitetalk: 48 GB+ cards (L40S, RTX 6000 Ada, "
+                         "L40, A6000, A100 80GB); for longcat: 80 GB cards (A100 80GB, H100)")
     ap.add_argument("--runpod-cloud", choices=("SECURE", "COMMUNITY"), default="SECURE",
                     help="runpod: SECURE guarantees a public ssh port")
     ap.add_argument("--runpod-disk", type=int, default=120, help="runpod: container disk GB (models + ComfyUI ~60 GB)")
@@ -610,7 +615,7 @@ def cmd_generate(args):
     log(f"plan: {p['audio_seconds']}s audio -> {len(jobs)} segment(s), {p['output_size'][0]}x{p['output_size'][1]}, "
         f"backend {args.backend}, workdir {work}")
     if args.dry_run:
-        print(f"PLAN output_size={p['output_size'][0]}x{p['output_size'][1]} segments={p['segments']} steps={args.steps} attention={args.attention} fp8_fast={args.fp8_fast} photo_crop={','.join(map(str, p['photo_crop']))} "
+        print(f"PLAN output_size={p['output_size'][0]}x{p['output_size'][1]} segments={p['segments']} model={args.model} steps={args.steps} attention={args.attention} fp8_fast={args.fp8_fast} photo_crop={','.join(map(str, p['photo_crop']))} "
               f"audio_seconds={p['audio_seconds']} backend={p['backend']} workdir={work}", flush=True)
         log(f"dry run: wrote {os.path.join(work, 'plan.json')} and in/jobs.json; nothing was rendered")
         print(json.dumps(p, indent=1))
@@ -685,9 +690,16 @@ def main():
     g.add_argument("--prompt", help="English scene description; see references/prompting.md")
     g.add_argument("--resolution", type=int, choices=(480, 720), default=480)
     g.add_argument("--size", help="exact WxH instead of --resolution (rounded down to multiples of 16)")
-    g.add_argument("--quality", choices=("fast", "high"), default="fast",
-                   help="fast (default): 4 steps + SageAttention + fp8 matmuls where the GPU has them, ~35%% quicker; "
-                        "high: 6 steps, plain attention and fp8 storage only. --steps/--attention/--fp8-fast override it")
+    g.add_argument("--model", choices=("infinitetalk", "longcat"), default="infinitetalk",
+                   help="infinitetalk (default; Wan 2.1 + InfiniteTalk via ComfyUI, fits a 40 GB A100) or longcat "
+                        "(LongCat-Video-Avatar 1.6: steadiest hands and identity in tests; needs an 80 GB GPU)")
+    g.add_argument("--lc-mix-alpha", type=float, default=0.5,
+                   help="longcat: DMD share in the distill LoRA mix (1.0 exaggerated the mouth; official default 0.5)")
+    g.add_argument("--lc-mix-steps", type=int, default=3, help="longcat: steps that use the LoRA mix (official default 3)")
+    g.add_argument("--quality", choices=("fast", "high"), default="high",
+                   help="high (default): 6 steps, plain attention, fp8 storage; best lip-sync in tests (SyncNet LSE-C 7.98 "
+                        "vs 7.02). fast: 4 steps + SageAttention + fp8 matmuls, ~35%% quicker but some syllables degrade. "
+                        "--steps/--attention/--fp8-fast override it")
     g.add_argument("--steps", type=int, help="sampling steps (the lightx2v LoRA is distilled for 4-8)")
     g.add_argument("--attention", choices=("sdpa", "sageattn"), help="attention kernel (sageattn is installed on demand)")
     g.add_argument("--fp8-fast", choices=("auto", "on", "off"),
@@ -711,6 +723,16 @@ def main():
     g.add_argument("--session", help="colab: run on this already-running session (e.g. one left by --keep); skips setup")
     g.add_argument("--dry-run", action="store_true", help="plan only: write plan.json/jobs.json, no GPU")
     args = ap.parse_args()
+    model = getattr(args, "model", "infinitetalk")
+    if args.backend is None:
+        args.backend = "runpod" if model == "longcat" else "colab"
+    if args.runpod_gpu is None:
+        args.runpod_gpu = ("NVIDIA A100-SXM4-80GB,NVIDIA A100 80GB PCIe,NVIDIA H100 80GB HBM3,NVIDIA H100 PCIe"
+                           if model == "longcat" else
+                           "NVIDIA L40S,NVIDIA RTX 6000 Ada Generation,NVIDIA L40,NVIDIA RTX A6000,"
+                           "NVIDIA A100 80GB PCIe,NVIDIA A100-SXM4-80GB")
+    if model == "longcat" and args.backend == "colab" and "H100" not in (args.gpu or ""):
+        raise SystemExit("longcat needs an 80 GB GPU; Colab's A100 is 40 GB: use --backend runpod (default) or ssh")
     if args.cmd == "generate":
         preset = {"fast": (4, "sageattn", "auto"), "high": (6, "sdpa", "off")}[args.quality]
         args.steps = args.steps if args.steps is not None else preset[0]

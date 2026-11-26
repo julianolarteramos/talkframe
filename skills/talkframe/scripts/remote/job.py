@@ -353,6 +353,20 @@ def main():
         raise SystemExit("No CUDA GPU visible to PyTorch.")
     log(f"GPU: {torch.cuda.get_device_name(0)}, torch {torch.__version__}")
 
+    jobs = json.load(open(f"{workdir}/in/jobs.json"))
+    if not _has("huggingface_hub"):  # both model paths download weights from the machine's own python
+        pip_install("huggingface_hub")
+    if any(j.get("model") == "longcat" for j in jobs):
+        # longcat.py ships next to job.py: in the work dir (Colab/ssh) or in scripts/remote (local backend).
+        # Under `colab exec` this code runs inside the kernel, where __file__ is not defined.
+        here = os.path.dirname(os.path.abspath(globals().get("__file__", f"{workdir}/job.py")))
+        sys.path[:0] = [here, workdir]
+        import longcat
+        report = longcat.run(workdir, jobs)
+        json.dump({"gpu": torch.cuda.get_device_name(0), "model": "longcat", "jobs": report},
+                  open(f"{workdir}/out/remote_report.json", "w"), indent=1)
+        log("ALL_DONE")
+        return
     # download the ~38 GB of models while ComfyUI and its dependencies install (they don't depend on each other)
     if not _has("huggingface_hub"):
         pip_install("huggingface_hub")
@@ -378,7 +392,6 @@ def main():
         raise SystemExit(f"model download failed: {dl_err[0]}")
     link_models(comfy, workdir)
     start_comfy(comfy, workdir, restart=restart)
-    jobs = json.load(open(f"{workdir}/in/jobs.json"))
     report = []
     for job in jobs:
         report.append({"name": job["name"], "render_seconds": round(render(job, comfy, workdir), 1)})

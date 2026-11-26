@@ -18,9 +18,11 @@ The heavy lifting happens on a GPU machine. `scripts/talkframe.py` plans the job
 
 2. **Look at the image and write the scene prompt** in English: who they are, where they are, what they hold, and how they should move while talking. A specific prompt is what makes the motion feel natural, so follow `references/prompting.md`. Don't describe lip shapes; the audio drives the mouth.
 
-3. **Choose the size and quality.**
-   - `--quality fast` is the default: 4 steps + SageAttention + fp8 matmuls on GPUs that have fp8 hardware. In side-by-side tests it was ~35 % quicker with no visible loss.
-   - `--quality high` (6 steps, plain attention) is for hero clips, or when the user asks for the best possible take.
+3. **Choose the model, size and quality.**
+   - `--model infinitetalk` (default): fits Colab's 40 GB A100, the cheapest per clip. Hands often stay at rest.
+   - `--model longcat` (LongCat-Video-Avatar 1.6, MIT): steadiest hands and identity of 6 models tested. It uses the official 50/50 distill-LoRA mix, because 100 % DMD exaggerated the mouth (`--lc-mix-alpha` / `--lc-mix-steps` tune it). It needs ~62 GB of VRAM, so it defaults to `--backend runpod` with 80 GB GPUs. Measured: 10 s of video in ~10 min end to end on an A100 80GB, ~US$0.35.
+   - `--quality high` is the default: 6 steps, plain attention. It had the best lip-sync of 17 test renders (SyncNet LSE-C 7.98 / LSE-D 6.64).
+   - `--quality fast` (4 steps + SageAttention + fp8 matmuls) is ~35 % quicker, but measurably worse on lip-sync (LSE-C 7.02 / LSE-D 7.62), and some syllables degrade. Use it only for drafts.
    - `--steps`, `--attention` and `--fp8-fast` override single parts.
    - Default `--resolution 480`: about 0.4 MP (848×480 for 16:9) and fastest. Good for overlays or anything shown smaller than ~1080 px wide.
    - `--resolution 720`: sharper, about 2–3× slower.
@@ -67,7 +69,8 @@ The heavy lifting happens on a GPU machine. `scripts/talkframe.py` plans the job
 | Too little body motion | A more specific prompt about gestures and the setting; a wider image with hands visible |
 | Face changes identity over a long clip | `--max-segment 30` |
 | A different take of the same clip | `--seed <n>` |
-| Softness or less detail than wanted | `--quality high` (6 steps, plain attention; ~35 % slower), then `--steps 8` or `--resolution 720` |
+| Softness or less detail than wanted | `--resolution 720` (more steps did not help: 8 measured worse than 6) |
+| Unstable hands or face drifting from the photo | `--model longcat` (steadiest hands and identity in tests; needs an 80 GB GPU, runs on RunPod) |
 | Logo or text in the photo wobbles (mic flag, sign, printed name) | `--protect-region X,Y,W,H` (photo pixels; see below) |
 | Mouth hangs open during short pauses | Partly handled: silences get a quiet noise floor before the model (measured ~20–30% less opening). The rest is the model anticipating the next word; avoid pure-zero gaps when editing the voice track. `--no-noise-floor` turns the floor off. |
 
