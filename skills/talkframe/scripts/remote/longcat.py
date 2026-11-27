@@ -12,6 +12,7 @@ Needs ~62 GB of VRAM at 480p (bf16): an 80 GB GPU.
 import json
 import math
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,9 @@ PIP = ["numpy==1.26.4", "transformers==4.41.0", "huggingface_hub>=0.34,<1.0", "d
 # prebuilt flash-attn wheels by (torch minor, python tag); building from source takes ~1 h
 FLASH = {("2.9", "cp312"): "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/"
                            "flash_attn-2.8.3%2Bcu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"}
+
+
+q = shlex.quote
 
 
 def log(msg):
@@ -111,8 +115,12 @@ def setup(workdir):
 def render(job, workdir, venv, repo):
     t0 = time.time()
     img, aud = f"{workdir}/in/{job['image']}", f"{workdir}/in/{job['audio']}"
-    dur = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", aud],
-                               capture_output=True, text=True).stdout or 0)
+    pr = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", aud],
+                        capture_output=True, text=True)
+    try:
+        dur = float(pr.stdout.strip())
+    except ValueError:
+        raise SystemExit(f"longcat: can't read the duration of {aud}: {pr.stderr.strip()[-300:]}")
     # Lead-in: LongCat's first ~10 frames drift (head jumps, teeth break up) until the photo anchors at frame 10
     # (--ref_img_index). Render that stretch over silence and cut it, so the voice starts on stable frames.
     lead = round(max(0.0, float(job.get("lc_lead", 0.6))) * 25)
@@ -128,7 +136,7 @@ def render(job, workdir, venv, repo):
     need = (93 + 80 * (segs - 1)) / 25 + 0.5
     if need > dur or lead:
         padded = f"{jdir}/audio_padded.wav"
-        sh(f"ffmpeg -v error -y -i {aud} -af adelay={lead * 40}:all=1,apad=whole_dur={max(need, dur):.3f} {padded}")
+        sh(f"ffmpeg -v error -y -i {q(aud)} -af adelay={lead * 40}:all=1,apad=whole_dur={max(need, dur):.3f} {q(padded)}")
         aud = padded
     json.dump({"prompt": job["prompt"], "cond_image": img, "cond_audio": {"person1": aud}}, open(f"{jdir}/job.json", "w"))
     threads = str(min(16, os.cpu_count() or 16))
@@ -159,8 +167,8 @@ def render(job, workdir, venv, repo):
     if not outs:
         raise SystemExit(f"longcat produced no video for {job['name']}")
     if lead:  # drop the lead-in frames; stitch() puts the original voice back over the rest
-        sh(f"ffmpeg -v error -y -i {outs[-1]} -vf trim=start_frame={lead},setpts=PTS-STARTPTS -an -c:v libx264 "
-           f"-crf 14 -preset medium -pix_fmt yuv420p {workdir}/out/{job['name']}.mp4")
+        sh(f"ffmpeg -v error -y -i {q(outs[-1])} -vf trim=start_frame={lead},setpts=PTS-STARTPTS -an -c:v libx264 "
+           f"-crf 14 -preset medium -pix_fmt yuv420p {q(workdir + '/out/' + job['name'] + '.mp4')}")
     else:
         shutil.copy(outs[-1], f"{workdir}/out/{job['name']}.mp4")
     secs = time.time() - t0

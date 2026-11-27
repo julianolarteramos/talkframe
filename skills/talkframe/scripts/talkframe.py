@@ -610,7 +610,9 @@ def fingerprint(args):
     if getattr(args, "model", "infinitetalk") == "longcat":
         # only what changes a LongCat render (seed, steps, attention and fp8 do not reach its script)
         keys = [k for k in keys if k not in ("seed", "steps", "attention", "fp8_fast", "quality", "audio_scale")]
-        keys += ["model", "lc_mix_alpha", "lc_mix_steps", "lc_lead"]
+        keys += ["model", "lc_mix_alpha", "lc_mix_steps"]
+        if getattr(args, "lc_lead", 0):
+            keys.append("lc_lead")  # --lc-lead 0 keeps fingerprints of LongCat renders made before the lead-in existed
     elif getattr(args, "negative", None):
         keys += ["negative", "nag_scale"]  # only when used, so earlier InfiniteTalk fingerprints stay valid
     for k in keys:
@@ -819,6 +821,14 @@ def main():
             raise SystemExit(f"{', '.join(ignored)} has no effect with --model longcat; drop it "
                              "(LongCat's knobs are --lc-mix-alpha, --lc-mix-steps and --lc-lead; it has no negative prompt in "
                              "distilled mode, so describe what you want in --prompt instead)")
+    if args.cmd == "generate" and model != "longcat":
+        ignored = [f for f, v in (("--lc-lead", args.lc_lead != 0.6), ("--lc-mix-alpha", args.lc_mix_alpha != 0.5),
+                                  ("--lc-mix-steps", args.lc_mix_steps != 3),
+                                  ("--nag-scale without --negative", args.nag_scale != 11.0 and not args.negative)) if v]
+        if ignored:
+            raise SystemExit(f"{', '.join(ignored)} has no effect here; drop it (--lc-* flags are for --model longcat; --nag-scale needs --negative)")
+        if args.nag_scale <= 0:
+            raise SystemExit("--nag-scale must be > 0")
     if args.cmd == "generate":
         preset = {"fast": (4, "sageattn", "auto"), "high": (6, "sdpa", "off")}[args.quality]
         args.steps = args.steps if args.steps is not None else preset[0]
