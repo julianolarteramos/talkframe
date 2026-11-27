@@ -28,6 +28,8 @@ Avoid lip or phoneme descriptions, emotional extremes ("screaming", "laughing ha
 | Hands melting or changing | "small, slow gestures, hands mostly resting on the desk" | `extra fingers, fused fingers` | Hands fully in frame, fingers separated |
 | Hair or background swimming | "her hair stays mostly still", "static camera" | — | — |
 
+Tested 2026-11-27 (desk presenter, one hand covering the other wrist): with resting hands there was no watch, but asking for gestures brought a smartwatch back even with `--negative "wristwatch, bracelet"` at `--nag-scale 11`. A negative prompt helps at the margins; the photo decides. If a detail must never appear, show the area it would cover in the photo.
+
 Don't ban "jewelry" in general when the photo has earrings or a nose ring: the model will fight the photo. Name the specific item you don't want.
 
 ## Examples
