@@ -21,6 +21,8 @@ The heavy lifting happens on a GPU machine. `scripts/talkframe.py` plans the job
 3. **Choose the model, size and quality.**
    - `--model infinitetalk` (default): fits Colab's 40 GB A100, the cheapest per clip. Hands often stay at rest.
    - `--model longcat` (LongCat-Video-Avatar 1.6, MIT): steadiest hands and identity of 6 models tested. It uses the official 50/50 distill-LoRA mix, because 100 % DMD exaggerated the mouth (`--lc-mix-alpha` / `--lc-mix-steps` tune it). It needs ~62 GB of VRAM, so it defaults to `--backend runpod` with 80 GB GPUs. Measured: 10 s of video in ~10 min end to end on an A100 80GB, ~US$0.35.
+   - LongCat's first ~10 frames drift (head pose jump, broken teeth) before the photo anchors; talkframe renders 0.6 s of silence first and cuts it (`--lc-lead`). Vertical 720p doesn't fit in 80 GB: use 480p and upscale.
+   - Keeping things out of the video (watch, bracelet, braces): `--negative "..."` on InfiniteTalk (applied with NAG, since cfg 1 ignores plain negatives). LongCat has no negative prompt: describe what you want instead. See references/prompting.md.
    - `--quality high` is the default: 6 steps, plain attention. It had the best lip-sync of 17 test renders (SyncNet LSE-C 7.98 / LSE-D 6.64).
    - `--quality fast` (4 steps + SageAttention + fp8 matmuls) is ~35 % quicker, but measurably worse on lip-sync (LSE-C 7.02 / LSE-D 7.62), and some syllables degrade. Use it only for drafts.
    - `--steps`, `--attention` and `--fp8-fast` override single parts.

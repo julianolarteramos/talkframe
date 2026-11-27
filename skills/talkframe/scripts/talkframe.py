@@ -167,6 +167,8 @@ def plan(args):
                      "attention": args.attention,
                      "fp8_fast": args.fp8_fast, "model": args.model, "resolution": args.resolution,
                      "lc_mix_alpha": args.lc_mix_alpha, "lc_mix_steps": args.lc_mix_steps,
+                     "lc_lead": getattr(args, "lc_lead", 0.6),
+                     "negative": getattr(args, "negative", None), "nag_scale": getattr(args, "nag_scale", 11.0),
                      # whole frames this part must fill, from absolute frame positions so rounding never accumulates
                      "frames": round(bounds[i + 1] * FPS) - round(bounds[i] * FPS)})
     json.dump(jobs, open(os.path.join(work, "in", "jobs.json"), "w"), indent=1)
@@ -608,7 +610,9 @@ def fingerprint(args):
     if getattr(args, "model", "infinitetalk") == "longcat":
         # only what changes a LongCat render (seed, steps, attention and fp8 do not reach its script)
         keys = [k for k in keys if k not in ("seed", "steps", "attention", "fp8_fast", "quality", "audio_scale")]
-        keys += ["model", "lc_mix_alpha", "lc_mix_steps"]
+        keys += ["model", "lc_mix_alpha", "lc_mix_steps", "lc_lead"]
+    elif getattr(args, "negative", None):
+        keys += ["negative", "nag_scale"]  # only when used, so earlier InfiniteTalk fingerprints stay valid
     for k in keys:
         h.update(f"{k}={getattr(args, k, None)}|".encode())
     return h.hexdigest()[:16]
@@ -758,6 +762,9 @@ def main():
     g.add_argument("--lc-mix-alpha", type=float, default=0.5,
                    help="longcat: DMD share in the distill LoRA mix (1.0 exaggerated the mouth; official default 0.5)")
     g.add_argument("--lc-mix-steps", type=int, default=3, help="longcat: steps that use the LoRA mix (official default 3)")
+    g.add_argument("--lc-lead", type=float, default=0.6,
+                   help="longcat: seconds of silence rendered before the voice and cut afterwards; LongCat's first ~10 "
+                        "frames drift (head pose jump, broken teeth) before the photo anchors at frame 10 (0 = off)")
     g.add_argument("--quality", choices=("fast", "high"), default="high",
                    help="high (default): 6 steps, plain attention, fp8 storage; best lip-sync in tests (SyncNet LSE-C 7.98 "
                         "vs 7.02). fast: 4 steps + SageAttention + fp8 matmuls, ~35%% quicker but some syllables degrade. "
@@ -768,6 +775,9 @@ def main():
                    help="fp8 matmuls: auto uses them only on GPUs with fp8 hardware (Ada/Hopper/Blackwell, not A100)")
     g.add_argument("--force", action="store_true",
                    help="render again even if --out already holds a video made from the same inputs")
+    g.add_argument("--negative", help="infinitetalk: things to keep out of the video (e.g. 'wristwatch, bracelet'), "
+                                      "applied with NAG because the fast LoRA runs at cfg 1 where a plain negative prompt does nothing")
+    g.add_argument("--nag-scale", type=float, default=11.0, help="infinitetalk: strength of --negative (NAG; default 11)")
     g.add_argument("--seed", type=int, default=2)
     g.add_argument("--audio-scale", type=float, default=1.0, help="raise (1.2-1.5) for stronger lip motion")
     g.add_argument("--max-segment", type=float, default=60.0, help="split audio longer than this (seconds) at pauses")
@@ -803,10 +813,12 @@ def main():
     if args.cmd == "generate" and model == "longcat":
         ignored = [f for f, v in (("--seed", args.seed != 2), ("--steps", args.steps is not None),
                                   ("--attention", args.attention is not None), ("--fp8-fast", args.fp8_fast is not None),
-                                  ("--audio-scale", args.audio_scale != 1.0), ("--quality", args.quality != "high")) if v]
+                                  ("--audio-scale", args.audio_scale != 1.0), ("--quality", args.quality != "high"),
+                                  ("--negative", bool(args.negative)), ("--nag-scale", args.nag_scale != 11.0)) if v]
         if ignored:
             raise SystemExit(f"{', '.join(ignored)} has no effect with --model longcat; drop it "
-                             "(LongCat's knobs are --lc-mix-alpha and --lc-mix-steps)")
+                             "(LongCat's knobs are --lc-mix-alpha, --lc-mix-steps and --lc-lead; it has no negative prompt in "
+                             "distilled mode, so describe what you want in --prompt instead)")
     if args.cmd == "generate":
         preset = {"fast": (4, "sageattn", "auto"), "high": (6, "sdpa", "off")}[args.quality]
         args.steps = args.steps if args.steps is not None else preset[0]

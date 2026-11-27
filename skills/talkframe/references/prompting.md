@@ -1,6 +1,6 @@
 # Writing the scene prompt
 
-InfiniteTalk takes the mouth from the audio and everything else from the photo plus this prompt. A vague prompt gives a stiff talking head. A concrete one gives eyebrows, nods, hand gestures and a background that breathes.
+The model takes the mouth from the audio and everything else from the photo plus this prompt. A vague prompt gives a stiff talking head. A concrete one gives eyebrows, nods, hand gestures and a background that breathes.
 
 ## Recipe (one paragraph, 50–90 words, English)
 
@@ -11,6 +11,24 @@ InfiniteTalk takes the mouth from the audio and everything else from the photo p
 5. **Camera:** "steady medium shot" (or close-up). Ask for a still camera unless the user wants motion.
 
 Avoid lip or phoneme descriptions, emotional extremes ("screaming", "laughing hard") unless the audio has them, and text you want legible on screen. The model can't render readable new text, though existing logos in the photo usually survive.
+
+## What the models actually read
+
+- **InfiniteTalk (fast LoRA, cfg 1):** a plain negative prompt is never evaluated at cfg 1. Use `--negative "..."`: talkframe applies it with NAG (Normalized Attention Guidance) inside attention, at no extra sampling cost. Keep it short and concrete (`"wristwatch, bracelet, dental braces"`); `--nag-scale` (default 11) sets its strength.
+- **LongCat (distilled):** text guidance is forced to 1 and there is no NAG, so it has no negative prompt at all. Its README asks for long, detailed prompts (appearance, clothing, actions, setting) with explicit "speaking/talking" verbs.
+- **Both:** say what you want instead of what you don't. Naming an object ("no watch") can make the model draw it; "bare forearms and wrists" doesn't.
+
+## Taming common artifacts
+
+| Problem | Prompt (positive) | `--negative` (InfiniteTalk) | Photo |
+|---|---|---|---|
+| Invented watch or bracelet when a hand lifts | "bare forearms and wrists" | `wristwatch, bracelet` | Both wrists visible and bare. A hand covering the other wrist makes the model guess what's under it |
+| Exaggerated mouth, big lower teeth | "speaks calmly with subtle, relaxed lip movements, mostly her upper teeth visible" | `wide open mouth, exaggerated mouth movements` | A closed or softly closed mouth in the photo |
+| Teeth that look like braces or mosaic | "natural, clean white teeth" | `dental braces` | Teeth sharp and evenly lit, or mouth closed |
+| Hands melting or changing | "small, slow gestures, hands mostly resting on the desk" | `extra fingers, fused fingers` | Hands fully in frame, fingers separated |
+| Hair or background swimming | "her hair stays mostly still", "static camera" | — | — |
+
+Don't ban "jewelry" in general when the photo has earrings or a nose ring: the model will fight the photo. Name the specific item you don't want.
 
 ## Examples
 

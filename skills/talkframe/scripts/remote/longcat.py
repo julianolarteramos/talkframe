@@ -113,11 +113,23 @@ def render(job, workdir, venv, repo):
     img, aud = f"{workdir}/in/{job['image']}", f"{workdir}/in/{job['audio']}"
     dur = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", aud],
                                capture_output=True, text=True).stdout or 0)
+    # Lead-in: LongCat's first ~10 frames drift (head jumps, teeth break up) until the photo anchors at frame 10
+    # (--ref_img_index). Render that stretch over silence and cut it, so the voice starts on stable frames.
+    lead = round(max(0.0, float(job.get("lc_lead", 0.6))) * 25)
+    dur += lead / 25
     # LongCat renders 93 frames, then 80 new frames per extra segment, at 25 fps
     segs = 1 + max(0, math.ceil((dur * 25 - 93) / 80))
     jdir = f"{workdir}/lc-jobs/{job['name']}"
     shutil.rmtree(jdir, ignore_errors=True)
     os.makedirs(f"{jdir}/out")
+    # The last segment usually runs past the voice. LongCat saves it with ffmpeg -shortest, which quits when the audio
+    # ends and breaks the frame pipe (BrokenPipeError). Pad with silence to the full segment length; stitch() trims
+    # the video back to the real audio afterwards.
+    need = (93 + 80 * (segs - 1)) / 25 + 0.5
+    if need > dur or lead:
+        padded = f"{jdir}/audio_padded.wav"
+        sh(f"ffmpeg -v error -y -i {aud} -af adelay={lead * 40}:all=1,apad=whole_dur={max(need, dur):.3f} {padded}")
+        aud = padded
     json.dump({"prompt": job["prompt"], "cond_image": img, "cond_audio": {"person1": aud}}, open(f"{jdir}/job.json", "w"))
     threads = str(min(16, os.cpu_count() or 16))
     env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "OMP_NUM_THREADS": threads,
@@ -146,7 +158,11 @@ def render(job, workdir, venv, repo):
                   key=os.path.getmtime)
     if not outs:
         raise SystemExit(f"longcat produced no video for {job['name']}")
-    shutil.copy(outs[-1], f"{workdir}/out/{job['name']}.mp4")
+    if lead:  # drop the lead-in frames; stitch() puts the original voice back over the rest
+        sh(f"ffmpeg -v error -y -i {outs[-1]} -vf trim=start_frame={lead},setpts=PTS-STARTPTS -an -c:v libx264 "
+           f"-crf 14 -preset medium -pix_fmt yuv420p {workdir}/out/{job['name']}.mp4")
+    else:
+        shutil.copy(outs[-1], f"{workdir}/out/{job['name']}.mp4")
     secs = time.time() - t0
     log(f"{job['name']}: done in {secs:.0f}s")
     return secs

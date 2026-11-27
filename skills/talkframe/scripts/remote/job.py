@@ -253,7 +253,7 @@ def quantization(job):
 
 def build_graph(job, image_name, audio_name):
     w, h = job["width"], job["height"]
-    return {
+    g = {
         "lora": {"class_type": "WanVideoLoraSelect", "inputs": {
             "lora": "WanVideo/Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors", "strength": 1.0}},
         "mt": {"class_type": "MultiTalkModelLoader", "inputs": {
@@ -295,6 +295,15 @@ def build_graph(job, image_name, audio_name):
             "format": "video/h264-mp4", "pix_fmt": "yuv420p", "crf": 17, "save_metadata": False, "trim_to_audio": True,
             "pingpong": False, "save_output": True}},
     }
+    if job.get("negative"):
+        # At cfg 1 (lightx2v LoRA) the regular negative prompt is never evaluated. NAG (Normalized Attention Guidance)
+        # applies it inside cross-attention instead, at no extra sampling pass: the encoder's 2nd output holds only it.
+        g["text"]["inputs"]["negative_prompt"] = job["negative"]
+        g["nag"] = {"class_type": "WanVideoApplyNAG", "inputs": {
+            "original_text_embeds": ["text", 0], "nag_text_embeds": ["text", 1],
+            "nag_scale": job.get("nag_scale", 11.0), "nag_tau": 2.5, "nag_alpha": 0.25}}
+        g["sampler"]["inputs"]["text_embeds"] = ["nag", 0]
+    return g
 
 
 def api(path, payload=None):
