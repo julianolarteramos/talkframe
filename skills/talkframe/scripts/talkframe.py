@@ -332,7 +332,11 @@ class Runpod(Ssh):
     """A fresh RunPod GPU pod per run, driven by `runpodctl` and the API key it stores (no MCP, no browser login).
 
     Tries the GPUs in --runpod-gpu in order (stock changes minute to minute), waits for SSH, runs the same job as the
-    ssh backend, and always deletes the pod at the end, also on errors and SIGTERM, unless --keep."""
+    ssh backend, and always deletes the pod at the end, also on errors and SIGTERM, unless --keep.
+
+    --session NAME names the pod `talkframe-NAME` and reuses it when it is already running (left by an earlier --keep),
+    so a batch pays for the install and the model download once; it creates the pod when there is none. A pod id works
+    too. Two runs can't share a pod at the same time: the second one fails while the first holds it."""
 
     IMAGE = "runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404"  # CUDA torch, python 3.12, uv, git, ffmpeg, sshd
 
@@ -342,6 +346,10 @@ class Runpod(Ssh):
         self.cloud, self.disk = args.runpod_cloud, args.runpod_disk
         self.py, self.rdir, self.qdir = "python3", "/root/talkframe-work", "/root/talkframe-work"
         self.pod, self.cost_hr, self.t_start = None, None, None
+        self.reuse = getattr(args, "session", None)
+        if self.reuse and not re.fullmatch(r"[A-Za-z0-9_.-]+", self.reuse):
+            raise SystemExit("--session must use only letters, digits, '.', '_' or '-'")
+        self.name = f"talkframe-{self.reuse}" if self.reuse else f"talkframe-{time.strftime('%H%M%S')}"
 
     def rp(self, *a, **kw):
         return run(["runpodctl", *a], **kw)
@@ -361,11 +369,61 @@ class Runpod(Ssh):
         log(f"runpod account ok, balance US${b:.2f}")
         return [] if b >= 1 else [f"low RunPod balance (US${b:.2f})"]
 
+    def attach(self, d):
+        """Point the ssh side at pod `d` (the JSON of `pod create` or `pod get`)."""
+        self.pod, self.cost_hr = d["id"], d.get("costPerHr")
+        sshd = d["ssh"]
+        self.host, self.port = f"root@{sshd['ip']}", str(sshd["port"])
+        key = (sshd.get("ssh_key") or {}).get("path") or os.path.expanduser("~/.runpod/ssh/runpodctl-ssh-key")
+        self.opts = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ServerAliveInterval=30",
+                     "-o", "ConnectTimeout=15", "-i", key, "-o", "IdentitiesOnly=yes"]
+        self.t_start = time.time()
+
+    def find(self):
+        """The running pod named by --session (pod name or id), or None."""
+        try:
+            pods = json.loads(self.rp("pod", "list", check=False).stdout or "[]")
+        except ValueError:
+            return None
+        for d in pods if isinstance(pods, list) else []:
+            if d.get("desiredStatus") == "RUNNING" and (d.get("id") == self.reuse or d.get("name") == self.name):
+                try:
+                    full = json.loads(self.rp("pod", "get", d["id"], check=False).stdout or "{}")
+                except ValueError:
+                    return None
+                return full if (full.get("ssh") or {}).get("ip") else None
+        return None
+
+    def reuse_pod(self):
+        """Attach to the --session pod if it is running and free; True when it is ready for this job."""
+        d = self.find()
+        if not d:
+            log(f"runpod: no running pod for --session {self.reuse}; creating {self.name}")
+            return False
+        try:
+            busy = json.load(open(lease_path("runpod", d["id"]))).get("busy")
+        except (OSError, ValueError):
+            busy = False
+        if busy:
+            raise SystemExit(f"--session {self.reuse}: pod {d['id']} is busy with another talkframe run")
+        lease_update("runpod", d["id"], busy=True)  # hold off the idle reaper while this job uses the pod
+        self.attach(d)
+        if self.ssh("nvidia-smi -L", check=False, timeout=60).returncode:
+            log(f"runpod: pod {self.pod} does not answer ssh; creating a new one")
+            lease_drop("runpod", self.pod)
+            self.pod = None
+            return False
+        log(f"runpod: reusing pod {self.pod} ({d.get('gpuId')}, US${self.cost_hr}/h); setup already done there")
+        Ssh.start(self)  # empty in/ and out/ so no file from the previous job leaks into this one
+        return True
+
     def start(self):
         problems = self.check()
         if problems:
             raise SystemExit("runpod not usable: " + "; ".join(problems))
-        name = f"talkframe-{time.strftime('%H%M%S')}"
+        if self.reuse and self.reuse_pod():
+            return
+        name = self.name
         for gpu in self.gpus:
             log(f"runpod: creating a pod with {gpu}")
             r = self.rp("pod", "create", "--name", name, "--image", self.IMAGE, "--gpu-id", gpu,
@@ -378,13 +436,7 @@ class Runpod(Ssh):
                 d = {}
             pid = d.get("id") or (re.search(r'"id"\s*:\s*"(\w+)"', out) or [None, None])[1]
             if r.returncode == 0 and d.get("ssh", {}).get("ip"):
-                self.pod, self.cost_hr = d["id"], d.get("costPerHr")
-                sshd = d["ssh"]
-                self.host, self.port = f"root@{sshd['ip']}", str(sshd["port"])
-                key = (sshd.get("ssh_key") or {}).get("path") or os.path.expanduser("~/.runpod/ssh/runpodctl-ssh-key")
-                self.opts = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ServerAliveInterval=30",
-                             "-o", "ConnectTimeout=15", "-i", key, "-o", "IdentitiesOnly=yes"]
-                self.t_start = time.time()
+                self.attach(d)
                 log(f"runpod: pod {self.pod} ({gpu}, US${self.cost_hr}/h, {d.get('machine', {}).get('dataCenterId')})")
                 break
             if pid:  # created but never became reachable: don't leave it billing
@@ -403,13 +455,16 @@ class Runpod(Ssh):
             time.sleep(10)
         else:
             raise SystemExit(f"runpod: pod {self.pod} never accepted ssh")
+        if self.reuse:
+            lease_update("runpod", self.pod, busy=True)  # a parallel run with the same --session must not join this pod
         self.ssh(f"mkdir -p {self.qdir}/in {self.qdir}/out")
 
     def stop(self):
         if not self.pod:
             return
         if self.keep:
-            log(f"leaving pod {self.pod} running (--keep); delete it with: runpodctl pod delete {self.pod}")
+            again = f"reuse it with --session {self.reuse}, " if self.reuse else ""
+            log(f"leaving pod {self.pod} running (--keep): {again}delete it with: runpodctl pod delete {self.pod}")
             return
         self.rp("pod", "delete", self.pod, check=False)
         log(f"runpod: pod {self.pod} deleted")
@@ -724,10 +779,11 @@ def main():
                         "photo's height (0.30 keeps the face in most portraits)")
     g.add_argument("--video-delay", type=int, default=0, help="frames to delay the picture vs the voice (lip-sync); 0 = none")
     g.add_argument("--no-noise-floor", action="store_true", help="send the audio to the model as-is (no noise floor in silences)")
-    g.add_argument("--keep", action="store_true", help="colab/runpod: leave the VM running after the job (reuse with --session)")
+    g.add_argument("--keep", action="store_true", help="colab/runpod: leave the VM/pod running after the job (reuse with --session)")
     g.add_argument("--keep-max", type=float, default=15,
                    help="with --keep: stop the VM automatically after this many idle minutes (0 = never; default 15)")
-    g.add_argument("--session", help="colab: run on this already-running session (e.g. one left by --keep); skips setup")
+    g.add_argument("--session", help="colab: run on this already-running session (e.g. one left by --keep). runpod: name "
+                                     "of the pod to reuse if running, created otherwise (pair with --keep for batches)")
     g.add_argument("--dry-run", action="store_true", help="plan only: write plan.json/jobs.json, no GPU")
     args = ap.parse_args()
     model = getattr(args, "model", "infinitetalk")

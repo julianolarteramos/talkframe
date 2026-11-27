@@ -48,9 +48,11 @@ runpodctl user                                    # shows the balance
 
 What talkframe does on each run:
 1. Creates a Secure Cloud pod from `runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404` (CUDA PyTorch, Python 3.12, uv, git and ffmpeg preinstalled) with a 120 GB disk. It tries the GPUs in `--runpod-gpu` in order and moves to the next on "no instances available". Default order: L40S, RTX 6000 Ada, L40, RTX A6000, A100 80GB PCIe, A100 SXM.
-2. Waits for an SSH login and runs `job.py` like the ssh backend. Installing and downloading take a few minutes on every run, because the pod is fresh.
+2. Waits for an SSH login and runs `job.py` like the ssh backend. Installing and downloading take a few minutes on a fresh pod (not on a reused `--session` pod).
 3. Downloads the parts and **deletes the pod**: always, including on errors and SIGTERM, unless `--keep`.
 4. Writes `runpod_usd_estimate` (the pod's hourly price × time it lived) into the report.
+
+Batches: pass the same `--session <name> --keep` on every call. The first call creates a pod named `talkframe-<name>`; the next ones find it running and reuse it, skipping the install and the model download. A pod id also works as `<name>`. Two runs can't share a pod at once: the second fails while the first holds it. The idle timer (`--keep-max`, default 15 min) deletes the pod after the last call; a final call without `--keep` deletes it right away.
 
 When none of the GPUs is free, it exits 75, like Colab.
 
