@@ -83,3 +83,25 @@ python3 talkframe.py generate --backend local --remote-python python3 ...
 ```
 
 The work directory is next to the output (`<out>.talkframe/`), including ComfyUI and the models. Pass `--workdir` to keep one shared location across runs.
+
+## fal: hosted models on fal.ai (`--model h3` / `--model omnihuman`)
+
+No GPU, install or model download: each audio part is uploaded with the photo to fal's CDN, rendered through fal's queue and downloaded. Billed per second of output, from the fal account balance.
+
+One-time setup: create a key at fal.ai/dashboard/keys, add credit at fal.ai/dashboard/billing, and save the key where talkframe reads it (or export `FAL_KEY`). Run this in a normal terminal so the key never shows up in a chat transcript:
+
+```bash
+mkdir -p ~/.config/fal && read -s K && printf '%s' "$K" > ~/.config/fal/key && chmod 600 ~/.config/fal/key
+python3 scripts/talkframe.py check --model h3   # "check ok", or fal's reason (bad key, "Exhausted balance")
+```
+
+| Model | fal endpoint | Prompt | Resolution | US$/s | Per request |
+|---|---|---|---|---|---|
+| `h3` (H3 Max Lip Sync) | `minimax/h3-max/lip-sync/image-to-video` | no | 480 / 768 / 1080 | 0.05 / 0.08 / 0.16 | 5–15 s |
+| `omnihuman` (OmniHuman 2.0) | `bytedance/omnihuman/v2` | yes | 720 | 0.105 | 4–300 s |
+
+- Longer audio is split at pauses into parts within the limit and rendered in parallel (4 at a time); a part shorter than the minimum is padded with silence and trimmed back when stitching.
+- The report's `fal_usd` is the cost from the durations fal billed. An interrupted run cancels the requests still in fal's queue.
+- Measured 2026-11-27, 12.7 s vertical clip: H3 480p 21 s / US$0.64, H3 768p 40 s / US$1.02, OmniHuman 2.0 2.8 min / US$1.34.
+- Both endpoints are licensed for commercial use. fal runs a content safety check, which can reject a request.
+

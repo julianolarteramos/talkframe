@@ -1,6 +1,6 @@
 ---
 name: talkframe
-description: Turn a still photo of a person plus a voice recording into a realistic talking video. The person speaks in sync with the audio and moves naturally (facial expressions, head, hands, hair, a living background). It runs InfiniteTalk (Wan 2.1) unattended on a rented GPU through Google Colab, an SSH GPU box, or a local NVIDIA GPU. Use this skill whenever the user wants to make a photo talk, animate a portrait with a voiceover, create a talking head, AI presenter, avatar, spokesperson, narrator or news-anchor clip from an image and audio, lip-sync a picture to speech, or add a speaking host to a reel, explainer or course video, even if they don't say "InfiniteTalk" or "lip sync".
+description: Turn a still photo of a person plus a voice recording into a realistic talking video. The person speaks in sync with the audio and moves naturally (facial expressions, head, hands, hair, a living background). It runs InfiniteTalk (Wan 2.1) or LongCat-Video-Avatar unattended on a rented GPU (Google Colab, RunPod, an SSH GPU box, a local NVIDIA GPU), or hosted models on fal.ai (H3 Max Lip Sync, OmniHuman 2.0) with no GPU to rent. Use this skill whenever the user wants to make a photo talk, animate a portrait with a voiceover, create a talking head, AI presenter, avatar, spokesperson, narrator or news-anchor clip from an image and audio, lip-sync a picture to speech, or add a speaking host to a reel, explainer or course video, even if they don't say "InfiniteTalk" or "lip sync".
 ---
 
 # talkframe
@@ -21,8 +21,15 @@ The heavy lifting happens on a GPU machine. `scripts/talkframe.py` plans the job
 3. **Choose the model, size and quality.**
    - `--model infinitetalk` (default): fits Colab's 40 GB A100, the cheapest per clip. Hands often stay at rest.
    - `--model longcat` (LongCat-Video-Avatar 1.6, MIT): steadiest hands and identity of 6 models tested. It uses the official 50/50 distill-LoRA mix, because 100 % DMD exaggerated the mouth (`--lc-mix-alpha` / `--lc-mix-steps` tune it). It needs ~62 GB of VRAM, so it defaults to `--backend runpod` with 80 GB GPUs. Measured: 10 s of video in ~10 min end to end on an A100 80GB, ~US$0.35.
-   - LongCat's first ~10 frames drift (head pose jump, broken teeth) before the photo anchors; talkframe renders 0.6 s of silence first and cuts it (`--lc-lead`). Vertical 720p doesn't fit in 80 GB: use 480p and upscale.
+   - LongCat's first ~10 frames drift (head pose jump, broken teeth) before the photo anchors; talkframe renders 0.6 s of silence first and cuts it (`--lc-lead`).
+   - LongCat at `--resolution 720` fits in 80 GB: talkframe keeps the text encoder on the CPU between prompts and decodes the VAE in tiles. It takes ~3× longer than 480p (12.7 s of vertical video: 26 min, ~US$1) and gave the best identity and almost no green flashes on the teeth.
+   - `--lc-mix-steps 0` runs LongCat with the OPSD LoRA only (strength `--lc-lora-mult`, default 0.8). LongCat's team blames the DMD LoRA for red lips and a wide mouth; in tests it halved the green teeth flashes and calmed the mouth, but SyncNet scored it lower.
+   - **Hosted on fal.ai (`--backend fal`, picked automatically):** no GPU, no setup, pay per second of video.
+     - `--model h3` (H3 Max Lip Sync): ~1 min per clip, exact sync (offset 0), the photo's framing kept, but no prompt: hands mostly stay still and the mouth can't be steered. `--resolution 480|768|1080` = US$0.05 / 0.08 / 0.16 per second. Audio is split into ≤14.5 s parts (its limit is 15 s per request), rendered in parallel.
+     - `--model omnihuman` (OmniHuman 2.0, ByteDance): takes `--prompt`, gestures follow it, 720p, US$0.105/s, ~3 min for 13 s. SyncNet scored it lower than the others.
+     - The photo and voice are uploaded to fal's CDN, so ask the user before the first run with someone's real face or voice.
    - Keeping things out of the video (watch, bracelet, braces): `--negative "..."` on InfiniteTalk (applied with NAG, since cfg 1 ignores plain negatives). LongCat has no negative prompt: describe what you want instead. See references/prompting.md.
+   - InfiniteTalk `--audio-cfg 2` (the official recipe with the fast LoRA) gave the best lip-sync measured (LSE-C 8.20 at 480p) at ~1.7× the render time. `--colormatch mkl` matches each window's colours to the photo (the wrapper's `reinhard` renders black, so it isn't offered).
    - `--quality high` is the default: 6 steps, plain attention. It had the best lip-sync of 17 test renders (SyncNet LSE-C 7.98 / LSE-D 6.64).
    - `--quality fast` (4 steps + SageAttention + fp8 matmuls) is ~35 % quicker, but measurably worse on lip-sync (LSE-C 7.02 / LSE-D 7.62), and some syllables degrade. Use it only for drafts.
    - `--steps`, `--attention` and `--fp8-fast` override single parts.
@@ -40,7 +47,7 @@ The heavy lifting happens on a GPU machine. `scripts/talkframe.py` plans the job
    ```bash
    python3 ${CLAUDE_SKILL_DIR}/scripts/talkframe.py generate \
      --image <photo> --audio <voice> --out <dir>/<name>.mp4 \
-     --prompt "<scene prompt>" [--resolution 480|720] [--backend colab|runpod|ssh|local] [--host user@gpu-box]
+     --prompt "<scene prompt>" [--model infinitetalk|longcat|h3|omnihuman] [--resolution 480|720] [--backend colab|runpod|ssh|local|fal] [--host user@gpu-box]
    ```
    - Exit code **75** means no GPU was free: Colab after all retries, or none of the RunPod GPU types in stock. Nothing is broken; try again later, or rerun the same command with the other backend (`--backend runpod` / `--backend colab`). Auth, balance and other permanent problems fail fast with exit 1 instead.
    - Several clips in a row: on Colab pass `--keep` on the first one, then `--session <name>` (printed at the end) on the next ones. On RunPod pass the same `--session <any-name> --keep` on every call: the first creates the pod `talkframe-<name>`, the rest reuse it. Either way the warm machine skips the setup and the model download. The last call without `--keep` stops the VM. As a safety net, a kept VM is stopped automatically after `--keep-max` idle minutes (default 15). The timer pauses while a `--session` job is using it.

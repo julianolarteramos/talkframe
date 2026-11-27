@@ -277,13 +277,13 @@ def build_graph(job, image_name, audio_name):
             "model": "wav2vec2-chinese-base_fp16.safetensors", "base_precision": "fp16", "load_device": "main_device"}},
         "emb": {"class_type": "MultiTalkWav2VecEmbeds", "inputs": {
             "wav2vec_model": ["w2v", 0], "audio_1": ["aud", 0], "normalize_loudness": True, "num_frames": 2000, "fps": 25.0,
-            "audio_scale": job.get("audio_scale", 1.0), "audio_cfg_scale": 1.0, "multi_audio_type": "para"}},
+            "audio_scale": job.get("audio_scale", 1.0), "audio_cfg_scale": job.get("audio_cfg", 1.0), "multi_audio_type": "para"}},
         "text": {"class_type": "WanVideoTextEncodeCached", "inputs": {
             "model_name": "umt5-xxl-enc-bf16.safetensors", "precision": "bf16", "positive_prompt": job["prompt"],
             "negative_prompt": NEGATIVE, "quantization": "disabled", "use_disk_cache": False, "device": "gpu"}},
         "i2v": {"class_type": "WanVideoImageToVideoMultiTalk", "inputs": {
             "vae": ["vae", 0], "width": ["resize", 1], "height": ["resize", 2], "frame_window_size": 81, "motion_frame": 9,
-            "force_offload": False, "colormatch": "disabled", "start_image": ["resize", 0], "tiled_vae": False,
+            "force_offload": False, "colormatch": job.get("colormatch", "disabled"), "start_image": ["resize", 0], "tiled_vae": False,
             "clip_embeds": ["clipenc", 0], "mode": "infinitetalk", "output_path": ""}},
         "sampler": {"class_type": "WanVideoSampler", "inputs": {
             "model": ["model", 0], "image_embeds": ["i2v", 0], "text_embeds": ["text", 0], "multitalk_embeds": ["emb", 0],

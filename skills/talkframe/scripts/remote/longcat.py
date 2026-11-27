@@ -112,6 +112,39 @@ def setup(workdir):
     return venv, repo
 
 
+TE_OFFLOAD = """
+    # talkframe, 720p only: keep the ~11 GB text encoder on the CPU except while it encodes, and decode the VAE in
+    # tiles, so 720p fits in 80 GB (same text-encoder approach as Synthesys-AI/longcat-video-avatar-replicate).
+    # 480p renders run the demo unchanged.
+    if os.environ.get("TALKFRAME_720"):
+        _t5_inner, _enc_outer = pipe._get_t5_prompt_embeds, pipe.encode_prompt
+        def _t5_on_gpu(*a, **k):
+            pipe.text_encoder.to(local_rank)
+            return _t5_inner(*a, **k)
+        def _enc_then_cpu(*a, **k):
+            try:
+                return _enc_outer(*a, **k)
+            finally:
+                pipe.text_encoder.to("cpu")
+                torch.cuda.empty_cache()
+        pipe._get_t5_prompt_embeds, pipe.encode_prompt = _t5_on_gpu, _enc_then_cpu
+        pipe.text_encoder.to("cpu")
+        torch.cuda.empty_cache()
+        pipe.vae.enable_tiling()  # the untiled VAE asked for ~18 GB more than an 80 GB GPU had left
+"""
+
+
+def patched_demo(repo):
+    """The official single-audio demo with the text encoder offloaded to the CPU between prompts."""
+    src = open(f"{repo}/run_demo_avatar_single_audio_to_video.py").read()
+    anchor = "    pipe.to(local_rank)\n"
+    if src.count(anchor) != 1:
+        raise SystemExit("longcat: the demo script changed; can't apply the text-encoder offload")
+    name = "run_demo_avatar_talkframe.py"
+    open(f"{repo}/{name}", "w").write(src.replace(anchor, anchor + TE_OFFLOAD))
+    return name
+
+
 def render(job, workdir, venv, repo):
     t0 = time.time()
     img, aud = f"{workdir}/in/{job['image']}", f"{workdir}/in/{job['audio']}"
@@ -142,13 +175,16 @@ def render(job, workdir, venv, repo):
     threads = str(min(16, os.cpu_count() or 16))
     env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "OMP_NUM_THREADS": threads,
            "MKL_NUM_THREADS": threads, "PATH": f"{venv}/bin:" + os.environ.get("PATH", "")}
+    if job.get("resolution") == 720:
+        env["TALKFRAME_720"] = "1"
     args = [f"{venv}/bin/python", "-m", "torch.distributed.run", "--standalone", "--nproc_per_node=1",
-            "run_demo_avatar_single_audio_to_video.py", "--context_parallel_size=1",
+            patched_demo(repo), "--context_parallel_size=1",
             f"--checkpoint_dir={workdir}/lc-weights/LongCat-Video-Avatar-1.6", "--stage_1=ai2v",
             "--model_type", "avatar-v1.6", f"--input_json={jdir}/job.json",
             f"--resolution={'720p' if job.get('resolution') == 720 else '480p'}", f"--num_segments={segs}",
             "--ref_img_index=10", "--mask_frame_range=0", "--use_distill", "--lora_path", "loraB/lora.safetensors",
             f"--mix_steps={job.get('lc_mix_steps', 3)}", f"--mix_alpha={job.get('lc_mix_alpha', 0.5)}",
+            f"--lora_multiplier={job.get('lc_lora_mult', 0.8)}",
             f"--output_dir={jdir}/out"]
     log(f"{job['name']}: {dur:.1f}s audio -> {segs} segment(s)")
     with open(f"{jdir}/gen.log", "w") as lf:

@@ -9,6 +9,7 @@ Backends
   colab   Google Colab via the official `colab` CLI (google-colab-cli). Needs Colab Pro/compute units.
   ssh     any Linux host with an NVIDIA GPU and CUDA PyTorch, reached with `ssh user@host`.
   local   this machine, if it has an NVIDIA GPU and CUDA PyTorch.
+  fal     fal.ai hosted models (--model h3 or omnihuman): no GPU to rent, pay per second of video.
 
 Only the Python standard library plus ffmpeg/ffprobe are needed locally.
 """
@@ -24,11 +25,21 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REMOTE_JOB = os.path.join(HERE, "remote", "job.py")
 REMOTE_FILES = [REMOTE_JOB, os.path.join(HERE, "remote", "longcat.py")]  # everything the GPU machine needs
-PIXELS = {480: 832 * 480, 720: 1280 * 720}
+PIXELS = {480: 832 * 480, 720: 1280 * 720, 768: 1344 * 768, 1080: 1920 * 1080}
+# Hosted models on fal.ai (backend fal). Prices are US$ per second of output, read from fal on 2026-11-27.
+FAL_MODELS = {
+    "h3": {"endpoint": "minimax/h3-max/lip-sync/image-to-video", "min_s": 5, "max_s": 15, "prompt": False, "seed": True,
+           "res": {480: "480P", 768: "768P", 1080: "1080P"}, "price": {"480P": 0.05, "768P": 0.08, "1080P": 0.16}},
+    "omnihuman": {"endpoint": "bytedance/omnihuman/v2", "min_s": 4, "max_s": 300, "prompt": True, "seed": False,
+                  "res": {720: None}, "price": {None: 0.105}},
+}
 DEFAULT_PROMPT = (
     "A person speaks directly to the camera with natural, expressive facial expressions, subtle head movements and blinking, "
     "gesturing naturally with their hands while explaining. Their hair moves slightly. Realistic, steady medium shot."
@@ -167,6 +178,8 @@ def plan(args):
                      "attention": args.attention,
                      "fp8_fast": args.fp8_fast, "model": args.model, "resolution": args.resolution,
                      "lc_mix_alpha": args.lc_mix_alpha, "lc_mix_steps": args.lc_mix_steps,
+                     "lc_lora_mult": getattr(args, "lc_lora_mult", 0.8),
+                     "colormatch": getattr(args, "colormatch", "disabled"), "audio_cfg": getattr(args, "audio_cfg", 1.0),
                      "lc_lead": getattr(args, "lc_lead", 0.6),
                      "negative": getattr(args, "negative", None), "nag_scale": getattr(args, "nag_scale", 11.0),
                      # whole frames this part must fill, from absolute frame positions so rounding never accumulates
@@ -497,7 +510,164 @@ class Local:
         pass
 
 
-BACKENDS = {"colab": Colab, "ssh": Ssh, "runpod": Runpod, "local": Local}
+class Fal:
+    """fal.ai hosted lip-sync models: each audio part is uploaded with the photo to fal's CDN, rendered through fal's queue
+    and downloaded. Standard library only. The key comes from $FAL_KEY or ~/.config/fal/key (never printed)."""
+    REST, CDN, QUEUE = "https://rest.fal.ai", "https://v3.fal.media", "https://queue.fal.run"
+
+    def __init__(self, args):
+        self.args = args
+        self.spec = FAL_MODELS.get(getattr(args, "model", ""), {})
+        self.res = (self.spec.get("res") or {}).get(getattr(args, "resolution", None))
+        self.pending = {}  # request id -> cancel url, for stop()
+        self.seconds = 0.0
+        import threading
+        self.lock, self.stopping = threading.Lock(), threading.Event()
+
+    def key(self):
+        k = os.environ.get("FAL_KEY")
+        if not k:
+            path = os.path.expanduser("~/.config/fal/key")
+            k = open(path).read().strip() if os.path.isfile(path) else ""
+        if not k:
+            raise SystemExit("no fal key: set FAL_KEY or save it in ~/.config/fal/key (chmod 600)")
+        return k
+
+    def http(self, url, data=None, headers=None, method=None, timeout=120):
+        # reads (status polls, results, downloads) are retried through network blips and fal's 429/5xx, so a dropped
+        # connection doesn't throw away parts that are already rendered and paid for; uploads and submits are not retried
+        tries = 5 if data is None and method is None else 1
+        for i in range(tries):
+            req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    return r.read()
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode(errors="replace")[:500]
+                if i + 1 < tries and (e.code == 429 or e.code >= 500):
+                    time.sleep(2 ** i * 3)
+                    continue
+                raise SystemExit(f"fal: HTTP {e.code} from {url.split('?')[0]}: {detail}")
+            except (urllib.error.URLError, OSError) as e:
+                if i + 1 < tries:
+                    time.sleep(2 ** i * 3)
+                    continue
+                raise SystemExit(f"fal: network error on {url.split('?')[0]}: {e}")
+
+    def api(self, url, payload=None, method=None):
+        data = None if payload is None else json.dumps(payload).encode()
+        return json.loads(self.http(url, data, {"Authorization": f"Key {self.key()}", "Content-Type": "application/json",
+                                               "Accept": "application/json"}, method) or b"{}")
+
+    def check(self):
+        try:
+            self.api(f"{self.REST}/storage/auth/token?storage_type=fal-cdn-v3", {})  # free; fails if the key or balance is bad
+        except SystemExit as e:
+            return [str(e)]
+        return []
+
+    def start(self):
+        bad = self.check()
+        if bad:
+            raise SystemExit(bad[0])
+
+    def upload(self, path, ctype):
+        tok = self.api(f"{self.REST}/storage/auth/token?storage_type=fal-cdn-v3", {})
+        body = self.http(f"{tok.get('base_url') or self.CDN}/files/upload", open(path, "rb").read(),
+                         {"Authorization": f"{tok['token_type']} {tok['token']}", "Content-Type": ctype,
+                          "X-Fal-File-Name": os.path.basename(path)}, timeout=300)
+        return json.loads(body)["access_url"]
+
+    def render(self, work, job, image_url):
+        t0 = time.time()
+        wav = os.path.join(work, "in", job["audio"])
+        sent = job["seconds"]
+        if job["seconds"] < self.spec["min_s"]:  # pad a short last part with silence; stitch() trims the picture back
+            padded = os.path.join(work, "in", job["name"] + "_padded.wav")
+            sent = self.spec["min_s"] + 0.2
+            run(["ffmpeg", "-v", "error", "-y", "-i", wav, "-af", f"apad=whole_dur={sent}", padded])
+            wav = padded
+        args = {"image_url": image_url, "audio_url": self.upload(wav, "audio/wav")}
+        if self.spec["prompt"] and job.get("prompt"):
+            args["prompt"] = job["prompt"]
+        if self.spec["seed"]:
+            args["seed"] = job["seed"]
+        if self.res:
+            args["resolution"] = self.res
+        sub = self.api(f"{self.QUEUE}/{self.spec['endpoint']}", args)
+        rid = sub["request_id"]
+        with self.lock:
+            self.pending[rid] = sub.get("cancel_url")
+        if self.stopping.is_set():  # submitted while the run was being stopped: cancel it too
+            self.stop()
+            raise SystemExit(f"{job['name']}: stopped")
+        log(f"{job['name']}: queued on fal ({self.spec['endpoint']})")
+        last, deadline = 0, time.time() + 1800 + 30 * sent  # generous: OmniHuman took ~13 s per second of video
+        while True:
+            if self.stopping.is_set():
+                raise SystemExit(f"{job['name']}: stopped")
+            if time.time() > deadline:
+                self.stop()
+                raise SystemExit(f"{job['name']}: fal did not finish in {(time.time() - t0) / 60:.0f} min; request cancelled")
+            st = self.api(sub["status_url"])
+            if st.get("status") == "COMPLETED":
+                break
+            if st.get("status") not in ("IN_QUEUE", "IN_PROGRESS"):
+                raise SystemExit(f"{job['name']}: unexpected fal status: {json.dumps(st)[:500]}")
+            if time.time() - last > 25:
+                log(f"{job['name']}: {st.get('status', '?').lower()} ({time.time() - t0:.0f}s)")
+                last = time.time()
+            time.sleep(4)
+        res = self.api(sub["response_url"])
+        with self.lock:
+            self.pending.pop(rid, None)
+            self.seconds += float(res.get("duration") or sent)
+        if "video" not in res:
+            raise SystemExit(f"fal returned no video for {job['name']}: {json.dumps(res)[:500]}")
+        with open(os.path.join(work, "out", job["name"] + ".mp4"), "wb") as f:
+            f.write(self.http(res["video"]["url"], timeout=600))
+        secs = time.time() - t0
+        log(f"{job['name']}: done in {secs:.0f}s")
+        return {"name": job["name"], "render_seconds": round(secs, 1)}
+
+    def run_job(self, work, jobs):
+        img = os.path.join(work, "in", jobs[0]["image"])
+        import mimetypes
+        image_url = self.upload(img, mimetypes.guess_type(img)[0] or "application/octet-stream")
+        from concurrent.futures import ThreadPoolExecutor
+        ex = ThreadPoolExecutor(max_workers=4)  # parts render in parallel on fal
+        try:
+            report = list(ex.map(lambda j: self.render(work, j, image_url), jobs))
+        except BaseException:
+            # interrupted, or one part failed: cancel what is still queued on fal before waiting for the workers,
+            # so the other parts aren't rendered (and billed) to the end first
+            self.stopping.set()
+            self.stop()
+            ex.shutdown(wait=False, cancel_futures=True)
+            raise
+        ex.shutdown()
+        json.dump({"gpu": f"fal:{self.spec['endpoint']}", "jobs": report},
+                  open(os.path.join(work, "out", "remote_report.json"), "w"), indent=1)
+
+    def stop(self):
+        with self.lock:
+            todo, self.pending = dict(self.pending), {}
+        for rid, url in todo.items():  # interrupted: don't let fal keep rendering (and billing)
+            try:
+                if not url:
+                    log(f"fal: no cancel link for request {rid}; it may still be billed")
+                    continue
+                self.api(url, method="PUT")
+                log(f"fal: cancelled request {rid}")
+            except BaseException:
+                log(f"fal: could not cancel request {rid}; it may still be billed")
+
+    def cost_usd(self):
+        rate = self.spec.get("price", {}).get(self.res, 0)
+        return round(self.seconds * rate, 2)
+
+
+BACKENDS = {"colab": Colab, "ssh": Ssh, "runpod": Runpod, "local": Local, "fal": Fal}
 
 
 # ---------------------------------------------------------------- stitching
@@ -607,14 +777,24 @@ def fingerprint(args):
                 h.update(chunk)
     keys = ["prompt", "resolution", "size", "steps", "seed", "audio_scale", "max_segment", "crop_y", "video_delay",
             "no_noise_floor", "protect_region", "attention", "fp8_fast", "quality"]  # InfiniteTalk: unchanged set
-    if getattr(args, "model", "infinitetalk") == "longcat":
+    if getattr(args, "model", "infinitetalk") in FAL_MODELS:
+        keys = ["model", "prompt", "resolution", "size", "max_segment", "crop_y", "video_delay", "no_noise_floor",
+                "protect_region"] + (["seed"] if FAL_MODELS[args.model]["seed"] else [])
+    elif getattr(args, "model", "infinitetalk") == "longcat":
         # only what changes a LongCat render (seed, steps, attention and fp8 do not reach its script)
         keys = [k for k in keys if k not in ("seed", "steps", "attention", "fp8_fast", "quality", "audio_scale")]
         keys += ["model", "lc_mix_alpha", "lc_mix_steps"]
         if getattr(args, "lc_lead", 0):
             keys.append("lc_lead")  # --lc-lead 0 keeps fingerprints of LongCat renders made before the lead-in existed
-    elif getattr(args, "negative", None):
-        keys += ["negative", "nag_scale"]  # only when used, so earlier InfiniteTalk fingerprints stay valid
+        if getattr(args, "lc_mix_steps", 3) == 0:
+            keys.append("lc_lora_mult")  # only read in OPSD-only mode
+    else:
+        if getattr(args, "negative", None):
+            keys += ["negative", "nag_scale"]  # only when used, so earlier InfiniteTalk fingerprints stay valid
+        if getattr(args, "colormatch", "disabled") != "disabled":
+            keys.append("colormatch")
+        if getattr(args, "audio_cfg", 1.0) != 1.0:
+            keys.append("audio_cfg")
     for k in keys:
         h.update(f"{k}={getattr(args, k, None)}|".encode())
     return h.hexdigest()[:16]
@@ -633,11 +813,14 @@ def protect_python():
 
 # ---------------------------------------------------------------- commands
 def add_common(ap):
-    ap.add_argument("--model", choices=("infinitetalk", "longcat"), default="infinitetalk",
-                    help="infinitetalk (default; Wan 2.1 + InfiniteTalk via ComfyUI, fits a 40 GB A100) or longcat "
-                         "(LongCat-Video-Avatar 1.6: steadiest hands and identity in tests; needs an 80 GB GPU)")
+    ap.add_argument("--model", choices=("infinitetalk", "longcat", *FAL_MODELS), default="infinitetalk",
+                    help="infinitetalk (default; Wan 2.1 + InfiniteTalk via ComfyUI, fits a 40 GB A100), longcat "
+                         "(LongCat-Video-Avatar 1.6: steadiest hands and identity in tests; needs an 80 GB GPU), or hosted "
+                         "on fal.ai: h3 (H3 Max Lip Sync: ~1 min, no prompt, US$0.05-0.16/s) or omnihuman (OmniHuman 2.0: "
+                         "takes a prompt, 720p, US$0.105/s)")
     ap.add_argument("--backend", choices=BACKENDS,
-                    help="default: colab for infinitetalk, runpod for longcat (Colab's 40 GB A100 is too small for it)")
+                    help="default: colab for infinitetalk, runpod for longcat (Colab's 40 GB A100 is too small for it), "
+                         "fal for h3/omnihuman")
     ap.add_argument("--gpu", default="A100,H100", help="colab GPU or comma list of fallbacks: A100, H100, L4 (default A100,H100)")
     ap.add_argument("--gpu-attempts", type=int, default=10, help="colab: retries when no GPU is free (1/min)")
     ap.add_argument("--host", help="ssh backend: user@host")
@@ -740,10 +923,12 @@ def cmd_generate(args):
     report = {**p, "wall_seconds": round(time.time() - t0), "gpu": remote.get("gpu"),
               "render_seconds": sum(j["render_seconds"] for j in remote.get("jobs", [])) or None,
               "colab_units_used": used if isinstance(be, Colab) else None,
-              "runpod_usd_estimate": be.cost_usd() if isinstance(be, Runpod) else None}
+              "runpod_usd_estimate": be.cost_usd() if isinstance(be, Runpod) else None,
+              "fal_usd": be.cost_usd() if isinstance(be, Fal) else None}
     json.dump(report, open(rep_path, "w"), indent=1)
     cost = (f"units {report['colab_units_used']}" if isinstance(be, Colab) else
-            f"~US${report['runpod_usd_estimate']}" if isinstance(be, Runpod) else "local")
+            f"~US${report['runpod_usd_estimate']}" if isinstance(be, Runpod) else
+            f"US${report['fal_usd']} on fal" if isinstance(be, Fal) else "local")
     log(f"DONE {p['output']} ({report['wall_seconds']}s wall, {cost}) report: {rep_path}")
     return 0
 
@@ -759,11 +944,23 @@ def main():
     g.add_argument("--audio", required=True, help="voice track (wav/mp3/m4a...)")
     g.add_argument("--out", required=True, help="output .mp4 path")
     g.add_argument("--prompt", help="English scene description; see references/prompting.md")
-    g.add_argument("--resolution", type=int, choices=(480, 720), default=480)
+    g.add_argument("--resolution", type=int, choices=(480, 720, 768, 1080),
+                   help="480 (default) or 720; h3: 480, 768 or 1080; omnihuman: always 720")
     g.add_argument("--size", help="exact WxH instead of --resolution (rounded down to multiples of 16)")
     g.add_argument("--lc-mix-alpha", type=float, default=0.5,
                    help="longcat: DMD share in the distill LoRA mix (1.0 exaggerated the mouth; official default 0.5)")
-    g.add_argument("--lc-mix-steps", type=int, default=3, help="longcat: steps that use the LoRA mix (official default 3)")
+    g.add_argument("--lc-mix-steps", type=int, default=3,
+                   help="longcat: steps that use the LoRA mix (official default 3); 0 = OPSD LoRA only, statically merged "
+                        "at --lc-lora-mult (faster: KV cache; the DMD LoRA is what reddens lips and widens the mouth)")
+    g.add_argument("--lc-lora-mult", type=float, default=0.8, help="longcat with --lc-mix-steps 0: OPSD LoRA strength (official default 0.8)")
+    g.add_argument("--colormatch", default="disabled",
+                   choices=("disabled", "mkl", "hm", "mvgd", "hm-mvgd-hm", "hm-mkl-hm"),
+                   help="infinitetalk: match each window's colours to the photo (the official InfiniteTalk does a "
+                        "Reinhard-style correction by default; the ComfyUI wrapper leaves it off). The InfiniteTalk node has no "
+                        "reinhard_torch, and its 'reinhard' (color-matcher) takes a log of [-1,1] pixels and renders black")
+    g.add_argument("--audio-cfg", type=float, default=1.0,
+                   help="infinitetalk: audio guidance; != 1 adds a pass without audio (~2x render time). The official "
+                        "recipe with the fast LoRA uses 2")
     g.add_argument("--lc-lead", type=float, default=0.6,
                    help="longcat: seconds of silence rendered before the voice and cut afterwards; LongCat's first ~10 "
                         "frames drift (head pose jump, broken teeth) before the photo anchors at frame 10 (0 = off)")
@@ -799,8 +996,11 @@ def main():
     g.add_argument("--dry-run", action="store_true", help="plan only: write plan.json/jobs.json, no GPU")
     args = ap.parse_args()
     model = getattr(args, "model", "infinitetalk")
+    hosted = model in FAL_MODELS
     if args.backend is None:
-        args.backend = "runpod" if model == "longcat" else "colab"
+        args.backend = "fal" if hosted else "runpod" if model == "longcat" else "colab"
+    if hosted != (args.backend == "fal"):
+        raise SystemExit("--model h3/omnihuman run only on --backend fal, and the fal backend only runs those models")
     if args.runpod_gpu is None:
         args.runpod_gpu = ("NVIDIA A100-SXM4-80GB,NVIDIA A100 80GB PCIe,NVIDIA H100 80GB HBM3,NVIDIA H100 PCIe"
                            if model == "longcat" else
@@ -813,17 +1013,48 @@ def main():
                              "ssh, or --gpu H100 if your Colab plan has it")
         args.gpu = "H100"  # never fall back to the 40 GB A100
     if args.cmd == "generate" and model == "longcat":
+        if args.lc_lora_mult != 0.8 and args.lc_mix_steps != 0:
+            raise SystemExit("--lc-lora-mult only applies with --lc-mix-steps 0 (OPSD LoRA only)")
         ignored = [f for f, v in (("--seed", args.seed != 2), ("--steps", args.steps is not None),
                                   ("--attention", args.attention is not None), ("--fp8-fast", args.fp8_fast is not None),
                                   ("--audio-scale", args.audio_scale != 1.0), ("--quality", args.quality != "high"),
-                                  ("--negative", bool(args.negative)), ("--nag-scale", args.nag_scale != 11.0)) if v]
+                                  ("--negative", bool(args.negative)), ("--nag-scale", args.nag_scale != 11.0),
+                                  ("--colormatch", args.colormatch != "disabled"), ("--audio-cfg", args.audio_cfg != 1.0)) if v]
         if ignored:
             raise SystemExit(f"{', '.join(ignored)} has no effect with --model longcat; drop it "
-                             "(LongCat's knobs are --lc-mix-alpha, --lc-mix-steps and --lc-lead; it has no negative prompt in "
+                             "(LongCat's knobs are --lc-mix-alpha, --lc-mix-steps, --lc-lora-mult and --lc-lead; it has no negative prompt in "
                              "distilled mode, so describe what you want in --prompt instead)")
-    if args.cmd == "generate" and model != "longcat":
+    if args.cmd == "generate" and hosted:
+        spec = FAL_MODELS[model]
+        ignored = [f for f, v in (("--steps", args.steps is not None), ("--attention", args.attention is not None),
+                                  ("--fp8-fast", args.fp8_fast is not None), ("--audio-scale", args.audio_scale != 1.0),
+                                  ("--quality", args.quality != "high"), ("--negative", bool(args.negative)),
+                                  ("--nag-scale", args.nag_scale != 11.0), ("--colormatch", args.colormatch != "disabled"),
+                                  ("--audio-cfg", args.audio_cfg != 1.0), ("--lc-lead", args.lc_lead != 0.6),
+                                  ("--lc-mix-alpha", args.lc_mix_alpha != 0.5), ("--lc-mix-steps", args.lc_mix_steps != 3),
+                                  ("--lc-lora-mult", args.lc_lora_mult != 0.8), ("--keep", args.keep),
+                                  ("--session", bool(args.session)), ("--prompt", bool(args.prompt) and not spec["prompt"]),
+                                  ("--seed", args.seed != 2 and not spec["seed"])) if v]
+        if ignored:
+            raise SystemExit(f"{', '.join(ignored)} has no effect with --model {model} on fal; drop it")
+        if args.resolution is None:
+            args.resolution = min(spec["res"])
+        if args.resolution not in spec["res"]:
+            raise SystemExit(f"--model {model} renders at {', '.join(map(str, spec['res']))} only")
+        top = spec["max_s"] - 0.5  # margin: re-encoding a part can add a few samples past fal's hard limit
+        if args.max_segment == 60.0:
+            args.max_segment = min(60.0, top)  # h3 takes 15 s per request; longer audio is split at pauses
+        if args.max_segment > top:
+            raise SystemExit(f"--max-segment can't exceed {top:g} s with --model {model}")
+    elif args.cmd == "generate":
+        if args.resolution is None:
+            args.resolution = 480
+        if args.resolution not in (480, 720):
+            raise SystemExit("--resolution 768/1080 is only for --model h3")
+    if args.cmd == "generate" and model == "infinitetalk":
         ignored = [f for f, v in (("--lc-lead", args.lc_lead != 0.6), ("--lc-mix-alpha", args.lc_mix_alpha != 0.5),
                                   ("--lc-mix-steps", args.lc_mix_steps != 3),
+                                  ("--lc-lora-mult", args.lc_lora_mult != 0.8),
                                   ("--nag-scale without --negative", args.nag_scale != 11.0 and not args.negative)) if v]
         if ignored:
             raise SystemExit(f"{', '.join(ignored)} has no effect here; drop it (--lc-* flags are for --model longcat; --nag-scale needs --negative)")

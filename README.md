@@ -27,6 +27,8 @@ Locally you need Python 3.9+ and `ffmpeg`. The GPU side installs itself.
 | `colab` (default) | Colab Pro or pay-as-you-go compute units, plus the [Colab CLI](https://github.com/googlecolab/google-colab-cli) | A100 at ~8 units/h. A 30 s clip takes ~15 min including setup, ~2 units (~US$0.20). |
 | `ssh` | Any Linux host with an NVIDIA GPU (≥24 GB), CUDA PyTorch and key-based SSH | Your machine's or cloud provider's rate |
 | `local` | This machine has the NVIDIA GPU | Free |
+| `runpod` | A RunPod account with credit, [`runpodctl`](https://github.com/runpod/runpodctl) and an API key | L40S ~US$1.1/h, A100 80 GB ~US$2.2/h. A 13 s clip: ~US$0.15–0.40 at 480p. |
+| `fal` | A [fal.ai](https://fal.ai) key with credit (`--model h3` or `--model omnihuman`, hosted, no GPU) | H3 Max: US$0.05–0.16 per second of video, ~1 min. OmniHuman 2.0: US$0.105/s, ~3 min. |
 
 One-time Colab setup:
 
@@ -83,3 +85,5 @@ talkframe's own code is Apache-2.0. The model weights are downloaded at run time
 - UMT5, CLIP ViT-H and chinese-wav2vec2-base
 
 Repackaging is by kijai and Comfy-Org. Check those licenses for your use case.
+
+`--model longcat` downloads LongCat-Video-Avatar (Meituan, MIT). `--model h3` and `--model omnihuman` are not downloaded: they run on fal.ai under fal's terms (commercial use allowed), and your photo and audio are uploaded there.
